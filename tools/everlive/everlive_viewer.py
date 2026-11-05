@@ -2189,6 +2189,7 @@ if HAS_QT:
         """
         fullscreen_requested = Signal()
         toggle_play_requested = Signal()
+        port_requested = Signal(int)
 
         def __init__(self, parent=None, duo_mode: bool = False):
             super().__init__(parent)
@@ -2199,6 +2200,7 @@ if HAS_QT:
 
             self.is_streaming = False
             self.has_signal = False
+            self.other_port_has_signal = None
             self.current_width = 1920
             self.current_height = 1080
             self.signal_desc = "Standby"
@@ -2214,12 +2216,24 @@ if HAS_QT:
             self.setMouseTracking(True)
             self.setCursor(Qt.PointingHandCursor)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.setMinimumHeight(280)
-            self.setStyleSheet("background-color: #0b0e14; border-radius: 8px;")
+            self.setMinimumHeight(360)
+            self.setStyleSheet("background-color: #080a10; border-radius: 8px;")
 
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.poll_frame)
             self.timer.start(16)
+
+        def hasHeightForWidth(self) -> bool:
+            return True
+
+        def heightForWidth(self, width: int) -> int:
+            return max(360, int(round(width * 9.0 / 16.0)))
+
+        def sizeHint(self) -> QSize:
+            return QSize(640, 360)
+
+        def minimumSizeHint(self) -> QSize:
+            return QSize(640, 360)
 
         def set_port(self, port: int):
             self.port = 1 if port == 1 else 0
@@ -2244,7 +2258,7 @@ if HAS_QT:
                         self.update()
                     return
                 try:
-                    self._shm_file = open(SHM_NAME, "r+b")
+                    self._shm_file = open(SHM_NAME, "rb")
                     self._shm_mmap = mmap.mmap(
                         self._shm_file.fileno(), 0, prot=mmap.PROT_READ)
                 except Exception:
@@ -2256,6 +2270,17 @@ if HAS_QT:
                 magic = struct.unpack_from("<I", self._shm_mmap, 0)[0]
                 if magic != SHM_MAGIC:
                     return
+
+                # In DUO mode, monitor the alternate port for active HDMI signal
+                if self.duo_mode:
+                    other_port = 1 if self.port == 0 else 0
+                    other_off = SHM_HEADER_SIZE + other_port * SHM_PORT_SIZE
+                    other_w, other_h, other_ns, other_st = struct.unpack_from(
+                        "<IIII", self._shm_mmap, other_off + 16)
+                    if other_st != 0 and other_ns == 0 and other_w > 0:
+                        self.other_port_has_signal = other_port
+                    else:
+                        self.other_port_has_signal = None
 
                 port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
                 seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
@@ -2338,81 +2363,105 @@ if HAS_QT:
 
             w = self.width()
             h = self.height()
-            painter.fillRect(0, 0, w, h, QColor("#0a0d14"))
+            # Canvas letterbox / background
+            painter.fillRect(0, 0, w, h, QColor("#0b0d13"))
+
+            # Calculate strict 16:9 embed geometry
+            embed_aspect = 16.0 / 9.0
+            viewport_aspect = float(w) / float(h if h > 0 else 1)
+            if viewport_aspect > embed_aspect:
+                embed_h = h
+                embed_w = int(round(embed_h * embed_aspect))
+                embed_x = (w - embed_w) // 2
+                embed_y = 0
+            else:
+                embed_w = w
+                embed_h = int(round(embed_w / embed_aspect))
+                embed_x = 0
+                embed_y = (h - embed_h) // 2
+            embed_rect = QRect(embed_x, embed_y, embed_w, embed_h)
+
+            # Draw 16:9 enclosure screen
+            painter.fillRect(embed_rect, QColor("#080a10"))
+            painter.setPen(QPen(QColor("#182030"), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(embed_rect.adjusted(0, 0, -1, -1), 8, 8)
 
             if (self._current_qimage and not self._current_qimage.isNull() and
                     self.is_streaming and self.has_signal):
                 img_w = self._current_qimage.width()
                 img_h = self._current_qimage.height()
 
+                # Determine target aspect ratio
                 if self.aspect == "4:3":
                     target_ratio = 4.0 / 3.0
-                elif self.aspect == "16:9":
+                elif self.aspect == "16:9" or self.aspect == "stretch":
                     target_ratio = 16.0 / 9.0
-                elif self.aspect == "stretch":
-                    target_ratio = float(w) / float(h if h > 0 else 1)
-                else:
-                    target_ratio = float(img_w) / float(img_h if img_h > 0 else 1)
+                else:  # auto
+                    if img_h > 0 and (abs(float(img_w) / img_h - 4.0 / 3.0) < 0.08 or
+                                      (img_w in (640, 720) and img_h in (480, 576))):
+                        target_ratio = 4.0 / 3.0
+                    else:
+                        target_ratio = 16.0 / 9.0
 
-                canvas_ratio = float(w) / float(h if h > 0 else 1)
                 if self.scale_mode == "integer":
-                    mult = max(1, min(w // img_w, h // img_h)) if (img_w > 0 and img_h > 0) else 1
+                    mult = max(1, min(embed_w // img_w, embed_h // img_h)) if (img_w > 0 and img_h > 0) else 1
                     dw = img_w * mult
                     dh = img_h * mult
-                    dx = (w - dw) // 2
-                    dy = (h - dh) // 2
+                    dx = embed_x + (embed_w - dw) // 2
+                    dy = embed_y + (embed_h - dh) // 2
                     target_rect = QRect(dx, dy, dw, dh)
                 else:
-                    if canvas_ratio > target_ratio:
-                        dh = h
-                        dw = int(dh * target_ratio)
-                        dx = (w - dw) // 2
-                        dy = 0
+                    if abs(target_ratio - (4.0 / 3.0)) < 0.01:
+                        # 4:3 content displayed centered inside 16:9 embed with symmetric pillarboxing
+                        dh = embed_h
+                        dw = int(round(dh * (4.0 / 3.0)))
+                        dx = embed_x + (embed_w - dw) // 2
+                        dy = embed_y
+                        target_rect = QRect(dx, dy, dw, dh)
                     else:
-                        dw = w
-                        dh = int(dw / target_ratio)
-                        dx = 0
-                        dy = (h - dh) // 2
-                    target_rect = QRect(dx, dy, dw, dh)
+                        # 16:9 fills the embed exactly
+                        target_rect = embed_rect
 
                 painter.drawImage(target_rect, self._current_qimage)
 
-                # Top-left signal badge
+                # Top-left signal badge inside 16:9 embed
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(15, 20, 30, 195))
-                painter.drawRoundedRect(12, 12, 185, 28, 6, 6)
+                painter.setBrush(QColor(15, 20, 30, 210))
+                painter.drawRoundedRect(embed_x + 12, embed_y + 12, 190, 28, 6, 6)
                 painter.setPen(QColor("#7fd1ad"))
                 painter.setFont(QFont("sans-serif", 9, QFont.Bold))
                 port_name = f"HDMI {self.port + 1}" if self.duo_mode else "HDMI Live"
-                painter.drawText(22, 30, f"● {port_name} · {self.signal_desc}")
+                painter.drawText(embed_x + 22, embed_y + 30, f"● {port_name} · {self.signal_desc}")
             else:
-                painter.setPen(QPen(QColor("#1e2738"), 1))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(1, 1, w - 2, h - 2, 8, 8)
-
+                # Standby / No signal screen inside 16:9 embed
                 painter.setPen(QColor("#5c6880"))
-                painter.setFont(QFont("sans-serif", 28))
-                painter.drawText(QRect(0, h // 2 - 64, w, 44), Qt.AlignCenter, "🎮")
+                painter.setFont(QFont("sans-serif", 32))
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 - 68, embed_w, 48), Qt.AlignCenter, "🎮")
 
                 if self.is_streaming and not self.has_signal:
-                    title = f"No HDMI Signal on HDMI {self.port + 1}" if self.duo_mode else "No HDMI Signal"
-                    subtitle = "Power on console or connect HDMI source to display feed"
+                    if self.other_port_has_signal is not None:
+                        title = f"No Signal on HDMI {self.port + 1} · HDMI {self.other_port_has_signal + 1} Active"
+                        subtitle = f"Active feed on HDMI {self.other_port_has_signal + 1} — Click here to switch"
+                    else:
+                        title = f"No HDMI Signal on HDMI {self.port + 1}" if self.duo_mode else "No HDMI Signal"
+                        subtitle = "Power on console or connect HDMI source to display feed"
                 else:
                     title = "EverLive Live Console Display"
                     subtitle = "Click [ Start Playing ] or double-click here to view live feed"
 
                 painter.setPen(QColor("#e6e9ef"))
                 painter.setFont(QFont("sans-serif", 13, QFont.Bold))
-                painter.drawText(QRect(0, h // 2 - 16, w, 24), Qt.AlignCenter, title)
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 - 14, embed_w, 24), Qt.AlignCenter, title)
 
-                painter.setPen(QColor("#8a94a6"))
-                painter.setFont(QFont("sans-serif", 10))
-                painter.drawText(QRect(0, h // 2 + 12, w, 20), Qt.AlignCenter, subtitle)
+                painter.setPen(QColor("#8a94a6" if self.other_port_has_signal is None else "#7fd1ad"))
+                painter.setFont(QFont("sans-serif", 10, QFont.Bold if self.other_port_has_signal is not None else QFont.Normal))
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 + 14, embed_w, 20), Qt.AlignCenter, subtitle)
 
-            # Top-right hover button
+            # Top-right hover button inside 16:9 embed
             btn_w, btn_h = 135, 28
-            btn_x = w - btn_w - 14
-            btn_y = 12
+            btn_x = embed_x + embed_w - btn_w - 14
+            btn_y = embed_y + 12
             self._fs_btn_rect = QRect(btn_x, btn_y, btn_w, btn_h)
 
             btn_bg = QColor(43, 79, 110, 230) if self._hover_fs else QColor(26, 32, 48, 195)
@@ -2436,6 +2485,9 @@ if HAS_QT:
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
             if self._fs_btn_rect.contains(pos):
                 self.fullscreen_requested.emit()
+            elif self.is_streaming and not self.has_signal and self.other_port_has_signal is not None:
+                self.set_port(self.other_port_has_signal)
+                self.port_requested.emit(self.other_port_has_signal)
             elif not self.is_streaming:
                 self.toggle_play_requested.emit()
 
@@ -2654,7 +2706,7 @@ if HAS_QT:
             # Check if autostart or headless start is requested
             if headless_start:
                 QTimer.singleShot(250, self.start_studio)
-            elif self.saved_cfg.get("autostart", False) or getattr(streamer, "_cli_autostart", False):
+            elif self.saved_cfg.get("autostart", True) or getattr(streamer, "_cli_autostart", False):
                 QTimer.singleShot(250, self.start_gaming_screen)
 
             QTimer.singleShot(300, self, self._ipc_try_attach)
@@ -3293,6 +3345,9 @@ if HAS_QT:
             self.video_canvas.set_port(saved_input)
             self.video_canvas.fullscreen_requested.connect(self.toggle_fullscreen)
             self.video_canvas.toggle_play_requested.connect(self.toggle_stream)
+            if self.duo_mode:
+                self.video_canvas.port_requested.connect(
+                    lambda p: self.combo_duo_input.setCurrentIndex(1 if p == 1 else 0) if hasattr(self, "combo_duo_input") else None)
             v_hero.addWidget(self.video_canvas)
 
             # Telemetry row: the detected audio format lives here instead of
@@ -3800,7 +3855,7 @@ if HAS_QT:
                 idx = self.combo_led.findData(led_mode)
                 if idx >= 0:
                     self.combo_led.setCurrentIndex(idx)
-                will_autostart = self._headless_start or self.saved_cfg.get("autostart", False) or getattr(self.streamer, "_cli_autostart", False)
+                will_autostart = self._headless_start or self.saved_cfg.get("autostart", True) or getattr(self.streamer, "_cli_autostart", False)
                 if isinstance(saved_led, int) and 0 <= saved_led <= 9 and not will_autostart:
                     if self.duo_mode:
                         # The DUO has no standby LED daemon; only talk to a
@@ -3922,7 +3977,7 @@ if HAS_QT:
             grid_out.addWidget(_field("App Behavior"), 3, 0)
 
             self.chk_autostart = QCheckBox("Auto-start on launch")
-            self.chk_autostart.setChecked(self.saved_cfg.get("autostart", False))
+            self.chk_autostart.setChecked(self.saved_cfg.get("autostart", True))
             self.chk_autostart.toggled.connect(lambda val: save_settings({"autostart": val}))
             grid_out.addWidget(self.chk_autostart, 3, 1)
 

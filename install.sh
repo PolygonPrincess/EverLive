@@ -14,6 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USERD_DIR="${SCRIPT_DIR}/tools/opengc573-userd"
 GC570D_DIR="${SCRIPT_DIR}/tools/opengc570d-userd"
+CORE_DIR="${SCRIPT_DIR}/tools/libeverlive-core"
 VIEWER_DIR="${SCRIPT_DIR}/tools/everlive"
 
 # ANSI Farben
@@ -417,6 +418,14 @@ detect_and_install_deps
 
 # 3. Userspace VFIO Engine kompilieren
 echo -e "\n${BLUE}[2/5] Kompiliere EverLive Userspace VFIO Engine...${NC}"
+if [ -d "${CORE_DIR}" ]; then
+    echo -e "${BLUE}[*] Kompiliere libeverlive-core...${NC}"
+    make -C "${CORE_DIR}" clean >/dev/null 2>&1 || true
+    make -C "${CORE_DIR}" -j"$(nproc)"
+    chmod 0755 "${CORE_DIR}/everlive-ctl" "${CORE_DIR}/libeverlive_core.so" 2>/dev/null || true
+    install -m 0755 "${CORE_DIR}/everlive-ctl" /usr/local/bin/ 2>/dev/null || true
+    install -m 0644 "${CORE_DIR}/libeverlive_core.so" /usr/local/lib/ 2>/dev/null || true
+fi
 make -C "${USERD_DIR}" clean >/dev/null 2>&1 || true
 make -C "${USERD_DIR}" -j"$(nproc)"
 echo -e "${BLUE}[*] Kompiliere GC570D (Live Gamer DUO) Userspace Engine...${NC}"

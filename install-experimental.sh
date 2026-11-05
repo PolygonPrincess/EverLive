@@ -22,6 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USERD_DIR="${SCRIPT_DIR}/tools/opengc573-userd"
 GC570D_DIR="${SCRIPT_DIR}/tools/opengc570d-userd"
+CORE_DIR="${SCRIPT_DIR}/tools/libeverlive-core"
 VIEWER_DIR="${SCRIPT_DIR}/tools/everlive"
 
 GREEN='\033[0;32m'
@@ -164,6 +165,11 @@ fi
 #    stable release uses; the Experimental branch adds lsfg-vk frame
 #    generation on top, so both can use the hardware (never at the same time).
 echo -e "\n${BLUE}[1/3] Building the userspace VFIO engine...${NC}"
+if [ -d "${CORE_DIR}" ]; then
+    echo -e "${BLUE}[*] Building libeverlive-core...${NC}"
+    make -C "${CORE_DIR}" -j"$(nproc)"
+    chmod 0755 "${CORE_DIR}/everlive-ctl" "${CORE_DIR}/libeverlive_core.so" 2>/dev/null || true
+fi
 make -C "${USERD_DIR}" -j"$(nproc)"
 chmod 0755 "${USERD_DIR}/gc573_user_streamer" "${USERD_DIR}/everlive_userd" "${USERD_DIR}/gc573_user_probe" "${USERD_DIR}/gc573_user_diag" 2>/dev/null || true
 if [ -d "${GC570D_DIR}" ]; then

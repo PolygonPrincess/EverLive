@@ -1107,7 +1107,7 @@ int gc570d_everlive_start(struct gc570d_shm_region *shm,
 
 	if (!shm || !options)
 		return -EINVAL;
-	if (!options->enable_sdl && !options->v4l2[0] && !options->v4l2[1])
+	if (!options->enable_sdl && !options->headless && !options->v4l2[0] && !options->v4l2[1])
 		return 0;
 	if (atomic_load_explicit(&g_everlive.running, __ATOMIC_ACQUIRE))
 		return -EBUSY;

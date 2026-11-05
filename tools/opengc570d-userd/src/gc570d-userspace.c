@@ -3109,9 +3109,9 @@ int main(int argc, char **argv)
 	probed = true;
 
 	/* Initialize POSIX shared-memory frame store for libgc570d-v4l2.so */
-	g_shm_fd = shm_open(GC570D_SHM_NAME, O_CREAT | O_RDWR, 0600);
+	g_shm_fd = shm_open(GC570D_SHM_NAME, O_CREAT | O_RDWR, 0666);
 	if (g_shm_fd >= 0) {
-		fchmod(g_shm_fd, 0600);
+		fchmod(g_shm_fd, 0666);
 		if (ftruncate(g_shm_fd, sizeof(struct gc570d_shm_region)) == 0) {
 			g_shm = mmap(NULL, sizeof(struct gc570d_shm_region),
 				     PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
