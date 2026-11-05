@@ -46,10 +46,12 @@ tests/test_framegen
 tests/test_ipc_json
 tests/test_edid_unifier
 tests/test_card_registry
+tests/test_frame_convert
 
 # libeverlive-core binaries
 tools/libeverlive-core/*.o
 tools/libeverlive-core/libeverlive_core.a
+tools/libeverlive-core/libeverlive_core.so
 tools/libeverlive-core/everlive-ctl
 tools/opengc573-userd/gc573_framegen_selftest
 

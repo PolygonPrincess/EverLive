@@ -68,6 +68,14 @@ udevadm trigger 2>/dev/null || true
 
 # 4. Desktop-Einträge & Icons entfernen
 #
+# Revert any injected LD_PRELOAD camera paths from user desktop launchers
+for df in "${TARGET_HOME}/.local/share/applications/"*.desktop; do
+    [ -f "$df" ] || continue
+    if grep -q "libgc570d-v4l2.so" "$df" 2>/dev/null; then
+        sed -i 's|env LD_PRELOAD=[^ ]*libgc570d-v4l2.so ||g' "$df"
+    fi
+done
+
 # Side-by-side safety: this branch installs everlive-experimental.desktop.  The
 # stable everlive.desktop (and its config/socket) must survive an Experimental
 # uninstall, so the icon set is only removed when no launcher is left either.

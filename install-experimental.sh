@@ -30,6 +30,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 WANT_FRAMEGEN="ask"
+WANT_PRELOAD="ask"
 
 usage() {
     cat <<EOF
@@ -42,6 +43,13 @@ Usage: ./install-experimental.sh [OPTIONS]
   --no-framegen, --skip-framegen
       Skip installing the optional lsfg-vk 2.0 Vulkan layer without prompting.
 
+  --with-preload, --preload-apps
+      Inject userspace camera LD_PRELOAD into user desktop launchers
+      (Discord, OBS, Chrome, Chromium) without prompting.
+
+  --no-preload, --skip-preload
+      Skip desktop launcher LD_PRELOAD injection and show manual launch instructions.
+
   -h, --help
       Show this help and exit.
 EOF
@@ -51,6 +59,8 @@ for arg in "$@"; do
     case "${arg}" in
         --with-framegen)               WANT_FRAMEGEN=1 ;;
         --no-framegen|--skip-framegen) WANT_FRAMEGEN=0 ;;
+        --with-preload|--preload-apps) WANT_PRELOAD=1 ;;
+        --no-preload|--skip-preload)   WANT_PRELOAD=0 ;;
         -h|--help)                     usage; exit 0 ;;
         *)
             echo "Unknown option: ${arg}" >&2
@@ -244,6 +254,120 @@ if [ -f "${APPS_DIR}/everlive.desktop" ]; then
 else
     echo -e "${YELLOW}[*] No stable everlive.desktop found; this is a standalone install.${NC}"
 fi
+
+# 6. Optional: Userspace camera LD_PRELOAD integration for Discord, Chrome, OBS
+configure_desktop_preloads() {
+    local preload_lib="/usr/local/lib/libgc570d-v4l2.so"
+    if [ ! -f "${preload_lib}" ] && [ -f "${GC570D_DIR}/libgc570d-v4l2.so" ]; then
+        preload_lib="${GC570D_DIR}/libgc570d-v4l2.so"
+    fi
+
+    local -a candidate_patterns=(
+        "discord.desktop:Discord"
+        "com.obsproject.Studio.desktop:OBS Studio"
+        "obs.desktop:OBS Studio"
+        "google-chrome.desktop:Google Chrome"
+        "google-chrome-stable.desktop:Google Chrome"
+        "chromium.desktop:Chromium"
+        "chromium-browser.desktop:Chromium"
+        "brave-browser.desktop:Brave Browser"
+    )
+
+    local -a matched_srcs=()
+    local -a matched_names=()
+    local -a matched_basenames=()
+
+    for item in "${candidate_patterns[@]}"; do
+        local fname="${item%%:*}"
+        local dname="${item#*:}"
+        local found=""
+        for search_dir in "/usr/share/applications" "/usr/local/share/applications" "${APPS_DIR}"; do
+            if [ -f "${search_dir}/${fname}" ]; then
+                found="${search_dir}/${fname}"
+                break
+            fi
+        done
+        if [ -n "${found}" ]; then
+            local dup=0
+            for existing in "${matched_basenames[@]:-}"; do
+                if [ "${existing}" = "${fname}" ]; then
+                    dup=1
+                    break
+                fi
+            done
+            if [ "${dup}" -eq 0 ]; then
+                matched_srcs+=("${found}")
+                matched_names+=("${dname}")
+                matched_basenames+=("${fname}")
+            fi
+        fi
+    done
+
+    echo -e "\n${BLUE}[*] Zero-DKMS Userspace Camera Desktop Integration (LD_PRELOAD)...${NC}"
+
+    if [ ${#matched_srcs[@]} -eq 0 ]; then
+        echo -e "    No supported applications (Discord, OBS, Chrome) found in /usr/share/applications."
+        echo -e "    To use EverLive's camera in any application manually:"
+        echo -e "      ${GREEN}LD_PRELOAD=${preload_lib} <application>${NC}"
+        return 0
+    fi
+
+    local do_inject=0
+    if [ "${WANT_PRELOAD}" = "1" ] || [ "${WANT_PRELOAD}" = "yes" ]; then
+        do_inject=1
+    elif [ "${WANT_PRELOAD}" = "0" ] || [ "${WANT_PRELOAD}" = "no" ]; then
+        do_inject=0
+    elif [ -t 0 ]; then
+        echo -e "Found the following video/voice applications on your system:"
+        for ((i=0; i<${#matched_names[@]}; i++)); do
+            echo -e "  - ${matched_names[$i]} (${matched_basenames[$i]})"
+        done
+        echo -e ""
+        echo -e "EverLive can configure user overrides in ~/.local/share/applications with"
+        echo -e "LD_PRELOAD so these applications automatically discover your capture card."
+        echo -n "Configure desktop launchers with EverLive camera preload? [y/N] "
+        read -r reply || true
+        case "$reply" in
+            [yY]|[yY][eE][sS]) do_inject=1 ;;
+            *) do_inject=0 ;;
+        esac
+    fi
+
+    if [ "${do_inject}" -eq 1 ]; then
+        mkdir -p "${APPS_DIR}"
+        for ((i=0; i<${#matched_srcs[@]}; i++)); do
+            local src="${matched_srcs[$i]}"
+            local fname="${matched_basenames[$i]}"
+            local dname="${matched_names[$i]}"
+            local dst="${APPS_DIR}/${fname}"
+
+            if [ -f "${dst}" ] && grep -q "LD_PRELOAD=" "${dst}" 2>/dev/null; then
+                echo -e "  ${GREEN}[✓] ${dname} already configured with LD_PRELOAD in ${dst}${NC}"
+            else
+                sed -E '/^Exec=/ {
+                    /LD_PRELOAD/! s|^Exec=(.*)$|Exec=env LD_PRELOAD='"${preload_lib}"' \1|
+                }' "${src}" > "${dst}"
+                chmod +x "${dst}"
+                if [ "${EUID}" -eq 0 ]; then
+                    chown "${TARGET_USER}:${TARGET_USER}" "${dst}" 2>/dev/null || true
+                fi
+                echo -e "  ${GREEN}[+] Configured ${dname} with camera preload in ${dst}${NC}"
+            fi
+        done
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "${APPS_DIR}" >/dev/null 2>&1 || true
+        fi
+    else
+        echo -e "  ${YELLOW}[*] Desktop launchers left untouched.${NC}"
+        echo -e "  To launch applications manually with the EverLive userspace camera:"
+        for ((i=0; i<${#matched_names[@]}; i++)); do
+            local cmd_name="$(echo "${matched_names[$i]}" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            echo -e "    ${GREEN}LD_PRELOAD=${preload_lib} ${cmd_name}${NC}"
+        done
+        echo -e "  Or add 'env LD_PRELOAD=${preload_lib}' to your custom launch scripts."
+    fi
+}
+configure_desktop_preloads
 
 echo -e "\n${GREEN}===================================================================${NC}"
 echo -e "${GREEN}      EverLive Experimental is ready in your application menu.     ${NC}"
