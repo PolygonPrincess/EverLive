@@ -90,6 +90,7 @@ FRAMEGEN_ALIASES = {
 
 DEFAULT_SETTINGS = {
     "v4l2_loopback": False,
+    "ui_mode": "simple",
     "aspect_ratio": "auto",
     "osd_enabled": True,
     "osd_position": "tr",
@@ -120,6 +121,8 @@ def load_settings() -> dict:
 
     settings = dict(DEFAULT_SETTINGS)
     settings.update(data)
+    if settings.get("ui_mode") not in ("simple", "pro"):
+        settings["ui_mode"] = "simple"
     if not isinstance(settings.get("v4l2_loopback"), bool):
         settings["v4l2_loopback"] = False
     if not isinstance(settings.get("minimize_to_tray"), bool):
@@ -2159,6 +2162,7 @@ if HAS_QT:
             self.enable_vsync = vsync
             self.muted = False
             self.saved_cfg = load_settings()
+            self.is_pro_mode = (self.saved_cfg.get("ui_mode") == "pro")
             self._headless_start = headless_start
             self._v4l2_device = v4l2_device
             # Remote control: set once we attach to a streamer we did not
@@ -2772,6 +2776,15 @@ if HAS_QT:
 
             top_bar.addStretch(1)
 
+            self.btn_pro_mode = QPushButton("Pro Settings ⚙" if not self.is_pro_mode else "Simple View ✕")
+            self.btn_pro_mode.setObjectName("btnGhost")
+            self.btn_pro_mode.setFixedHeight(28)
+            self.btn_pro_mode.setStyleSheet("padding: 0px 12px; font-weight: 600;")
+            self.btn_pro_mode.setCursor(Qt.PointingHandCursor)
+            self.btn_pro_mode.setToolTip("Toggle between Simple View (clean zero-friction console hub) and Pro Settings (granular EDID, exposure, and OBS controls)")
+            self.btn_pro_mode.clicked.connect(self.toggle_pro_mode)
+            top_bar.addWidget(self.btn_pro_mode, 0, Qt.AlignVCenter)
+
             btn_discord = QPushButton("Discord")
             btn_discord.setObjectName("btnGhost")
             btn_discord.setFixedHeight(28)
@@ -2845,6 +2858,20 @@ if HAS_QT:
                 "IT6805 / SDL2 stream log.")
             h_telemetry.addWidget(self.lbl_audio_fmt, 0, Qt.AlignVCenter)
             h_telemetry.addStretch(1)
+
+            lbl_quick_preset = QLabel("Console Preset")
+            lbl_quick_preset.setObjectName("heroMeta")
+            h_telemetry.addWidget(lbl_quick_preset, 0, Qt.AlignVCenter)
+
+            self.combo_quick_preset = QComboBox()
+            self.combo_quick_preset.addItem("🎮 Auto (Recommended)", "auto")
+            self.combo_quick_preset.addItem("📺 Modern Console (4K60 HDR)", "console_4k")
+            self.combo_quick_preset.addItem("⚡ Esports High Refresh (1440p120)", "esports_1440p")
+            self.combo_quick_preset.addItem("🕹️ Retro Gaming (1080p 4:3 Integer)", "retro_1080p")
+            self.combo_quick_preset.setToolTip(
+                "Console Quick Preset: automatically configures optimal EDID, aspect ratio, HDR, and scaling.")
+            self.combo_quick_preset.currentIndexChanged.connect(self._on_quick_preset_changed)
+            h_telemetry.addWidget(self.combo_quick_preset, 0, Qt.AlignVCenter)
 
             if self.duo_mode:
                 lbl_duo = QLabel("DUO Input")
@@ -3471,11 +3498,87 @@ if HAS_QT:
             root_layout.addStretch(1)
             root_layout.addWidget(bottom_box)
 
+            self.card_video = card_video
+            self.card_audio = card_audio
+            self.card_out = card_out
+            self._apply_pro_mode()
+
             # Initial status poll
             self.update_status()
 
             # System Tray Integration
             self._init_tray()
+
+        def toggle_pro_mode(self):
+            self.is_pro_mode = not self.is_pro_mode
+            self._apply_pro_mode()
+            save_settings({"ui_mode": "pro" if self.is_pro_mode else "simple"})
+
+        def _apply_pro_mode(self):
+            if hasattr(self, "card_video") and hasattr(self, "card_out"):
+                self.card_video.setVisible(self.is_pro_mode)
+                self.card_out.setVisible(self.is_pro_mode)
+            if hasattr(self, "btn_pro_mode"):
+                self.btn_pro_mode.setText("Simple View ✕" if self.is_pro_mode else "Pro Settings ⚙")
+            target_h = (856 if self.duo_mode else 800) if self.is_pro_mode else (520 if self.duo_mode else 480)
+            self.setFixedSize(920, target_h)
+
+        def _on_quick_preset_changed(self, index: int):
+            key = self.combo_quick_preset.itemData(index)
+            if key == "console_4k":
+                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
+                    idx = self.combo_presets.findData("default")
+                    if idx >= 0:
+                        self.combo_presets.setCurrentIndex(idx)
+                if hasattr(self, "chk_hdr"):
+                    self.chk_hdr.setChecked(True)
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("auto")
+                    if idx >= 0:
+                        self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0:
+                        self.combo_scale.setCurrentIndex(idx)
+            elif key == "esports_1440p":
+                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
+                    idx = self.combo_presets.findData("1440p120")
+                    if idx >= 0:
+                        self.combo_presets.setCurrentIndex(idx)
+                if hasattr(self, "chk_hdr"):
+                    self.chk_hdr.setChecked(False)
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("auto")
+                    if idx >= 0:
+                        self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0:
+                        self.combo_scale.setCurrentIndex(idx)
+            elif key == "retro_1080p":
+                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
+                    idx = self.combo_presets.findData("1080p240")
+                    if idx >= 0:
+                        self.combo_presets.setCurrentIndex(idx)
+                if hasattr(self, "chk_hdr"):
+                    self.chk_hdr.setChecked(False)
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("4:3")
+                    if idx >= 0:
+                        self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("integer")
+                    if idx >= 0:
+                        self.combo_scale.setCurrentIndex(idx)
+            elif key == "auto":
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("auto")
+                    if idx >= 0:
+                        self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0:
+                        self.combo_scale.setCurrentIndex(idx)
 
         def _set_launch_running(self, running: bool, mode: Optional[str] = None):
             if running:

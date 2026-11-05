@@ -5,8 +5,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORE_DIR="${SCRIPT_DIR}/tools/libeverlive-core"
 GC573_DIR="${SCRIPT_DIR}/tools/opengc573-userd"
 GC570D_DIR="${SCRIPT_DIR}/tools/opengc570d-userd"
+
+echo "[*] Baue EverLive Core Hardware Abstraction Library (libeverlive-core & everlive-ctl)..."
+make -C "${CORE_DIR}" clean >/dev/null 2>&1 || true
+make -C "${CORE_DIR}" -j"$(nproc)"
 
 echo "[*] Baue EverLive GC573 Userspace VFIO Engine (gc573_user_streamer & everlive_userd)..."
 make -C "${GC573_DIR}" clean >/dev/null 2>&1 || true

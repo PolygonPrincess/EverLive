@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 CC ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -std=gnu11 -D_GNU_SOURCE
-INCLUDES := -I../tools/opengc570d-userd/src -I../tools/opengc570d-userd -I../tools/opengc573-userd
+INCLUDES := -I../tools/opengc570d-userd/src -I../tools/opengc570d-userd -I../tools/opengc573-userd -I../tools/libeverlive-core
 DEFS := -DGC570D_USERSPACE
 
 GC570D_DIR := ../tools/opengc570d-userd/src
 GC573_DIR := ../tools/opengc573-userd
+CORE_DIR := ../tools/libeverlive-core
 
-TARGETS := test_edid test_config test_framegen test_ipc_json test_edid_unifier
+TARGETS := test_edid test_config test_framegen test_ipc_json test_edid_unifier test_card_registry
 
 all: $(TARGETS)
 
@@ -26,6 +27,9 @@ test_ipc_json: test_ipc_json.c
 test_edid_unifier: test_edid_unifier.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
+test_card_registry: test_card_registry.c $(CORE_DIR)/everlive_card.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: all
 
@@ -36,6 +40,7 @@ test: all
 	@./test_framegen
 	@./test_ipc_json
 	@./test_edid_unifier
+	@./test_card_registry
 
 clean:
 	rm -f $(TARGETS)
