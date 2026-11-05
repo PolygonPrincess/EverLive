@@ -489,7 +489,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSlider, QFrame,
         QGroupBox, QMessageBox, QStackedLayout, QSizePolicy, QFileDialog,
-        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox
+        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox, QScrollArea
     )
     from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize, QRect, QPoint
     from PySide6.QtGui import (
@@ -1597,8 +1597,9 @@ class GameStreamer:
                         volume: float) -> bool:
         """Launch the GC570D (Live Gamer DUO) userspace engine."""
         if _vfio_streamer_running():
-            print("[!] A userspace streamer is already running; refusing to start a second instance.")
-            return False
+            print("[*] Userspace streamer is already active; attaching to live feed.")
+            self.is_running = True
+            return True
 
         if not (os.path.isfile(self.streamer_bin) and
                 os.access(self.streamer_bin, os.X_OK)):
@@ -1752,8 +1753,9 @@ class GameStreamer:
                 scale=scale, volume=volume)
 
         if _vfio_streamer_running():
-            print("[!] A userspace streamer is already running; refusing to start a second instance.")
-            return False
+            print("[*] Userspace streamer is already active; attaching to live feed.")
+            self.is_running = True
+            return True
 
         if not (os.path.isfile(self.streamer_bin) and
                 os.access(self.streamer_bin, os.X_OK)):
@@ -2156,6 +2158,9 @@ class GameStreamer:
                 self.stop()
                 return False
             return True
+        elif self.vfio_mode and _vfio_streamer_running():
+            self._read_vfio_log()
+            return True
         return False
 
 
@@ -2216,7 +2221,8 @@ if HAS_QT:
             self.setMouseTracking(True)
             self.setCursor(Qt.PointingHandCursor)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.setMinimumHeight(360)
+            self.setMinimumHeight(400)
+            self.setMinimumWidth(712)
             self.setStyleSheet("background-color: #080a10; border-radius: 8px;")
 
             self.timer = QTimer(self)
@@ -2227,13 +2233,13 @@ if HAS_QT:
             return True
 
         def heightForWidth(self, width: int) -> int:
-            return max(360, int(round(width * 9.0 / 16.0)))
+            return max(400, int(round(width * 9.0 / 16.0)))
 
         def sizeHint(self) -> QSize:
-            return QSize(640, 360)
+            return QSize(720, 405)
 
         def minimumSizeHint(self) -> QSize:
-            return QSize(640, 360)
+            return QSize(712, 400)
 
         def set_port(self, port: int):
             self.port = 1 if port == 1 else 0
@@ -2448,7 +2454,7 @@ if HAS_QT:
                         subtitle = "Power on console or connect HDMI source to display feed"
                 else:
                     title = "EverLive Live Console Display"
-                    subtitle = "Click [ Start Playing ] or double-click here to view live feed"
+                    subtitle = "Waiting for HDMI input signal..."
 
                 painter.setPen(QColor("#e6e9ef"))
                 painter.setFont(QFont("sans-serif", 13, QFont.Bold))
@@ -2651,7 +2657,7 @@ if HAS_QT:
             self.enable_vsync = vsync
             self.muted = False
             self.saved_cfg = load_settings()
-            self.is_pro_mode = (self.saved_cfg.get("ui_mode") == "pro")
+            self.is_advanced_mode = (self.saved_cfg.get("ui_mode") in ("advanced", "pro"))
             self._headless_start = headless_start
             self._v4l2_device = v4l2_device
             # Remote control: set once we attach to a streamer we did not
@@ -2703,11 +2709,16 @@ if HAS_QT:
             self._ipc_timer.setInterval(1000)
             self._ipc_timer.timeout.connect(self._poll_remote_status)
 
-            # Check if autostart or headless start is requested
-            if headless_start:
-                QTimer.singleShot(250, self.start_studio)
+            # Auto-attach to already running capture engine or start automatically on launch
+            if _vfio_streamer_running():
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                print("[*] Userspace capture engine already active; attaching live feed.")
+            elif headless_start:
+                QTimer.singleShot(150, self.start_studio)
             elif self.saved_cfg.get("autostart", True) or getattr(streamer, "_cli_autostart", False):
-                QTimer.singleShot(250, self.start_gaming_screen)
+                QTimer.singleShot(150, lambda: self.start_gaming_screen(detached=False))
 
             QTimer.singleShot(300, self, self._ipc_try_attach)
 
@@ -2715,8 +2726,8 @@ if HAS_QT:
             self.setWindowTitle("EverLive - Console Hub")
             # Compact console-hub layout: sized so the cards below never
             # squash on Live Gamer DUO (with secondary action bar) or GC573.
-            self.setMinimumSize(920, 680)
-            self.resize(920, 860 if self.duo_mode else 820)
+            self.setMinimumSize(880, 640)
+            self.resize(920, 940 if self.is_advanced_mode else 680)
 
             # Application & Window Icon
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "everlive.png")
@@ -3270,14 +3281,15 @@ if HAS_QT:
 
             top_bar.addStretch(1)
 
-            self.btn_pro_mode = QPushButton("Pro Settings ⚙" if not self.is_pro_mode else "Simple View ✕")
-            self.btn_pro_mode.setObjectName("btnGhost")
-            self.btn_pro_mode.setFixedHeight(28)
-            self.btn_pro_mode.setStyleSheet("padding: 0px 12px; font-weight: 600;")
-            self.btn_pro_mode.setCursor(Qt.PointingHandCursor)
-            self.btn_pro_mode.setToolTip("Toggle between Simple View (clean zero-friction console hub) and Pro Settings (granular EDID, exposure, and OBS controls)")
-            self.btn_pro_mode.clicked.connect(self.toggle_pro_mode)
-            top_bar.addWidget(self.btn_pro_mode, 0, Qt.AlignVCenter)
+            self.btn_advanced = QPushButton("Advanced ⚙" if not self.is_advanced_mode else "Hide Advanced ✕")
+            self.btn_advanced.setObjectName("btnGhost")
+            self.btn_advanced.setFixedHeight(28)
+            self.btn_advanced.setStyleSheet("padding: 0px 12px; font-weight: 600;")
+            self.btn_advanced.setCursor(Qt.PointingHandCursor)
+            self.btn_advanced.setToolTip("Toggle between Simple View (clean zero-friction console hub) and Advanced Settings (granular EDID, exposure, and OBS controls)")
+            self.btn_advanced.clicked.connect(self.toggle_advanced_mode)
+            self.btn_pro_mode = self.btn_advanced
+            top_bar.addWidget(self.btn_advanced, 0, Qt.AlignVCenter)
 
             btn_discord = QPushButton("Discord")
             btn_discord.setObjectName("btnGhost")
@@ -3312,7 +3324,7 @@ if HAS_QT:
             h_sig_info = QHBoxLayout()
             h_sig_info.setSpacing(12)
             v_sig_text = QVBoxLayout()
-            v_sig_text.setSpacing(6)
+            v_sig_text.setSpacing(4)
 
             self.lbl_hero_signal = QLabel("Waiting for HDMI signal...")
             self.lbl_hero_signal.setObjectName("heroSignal")
@@ -3325,6 +3337,15 @@ if HAS_QT:
             v_sig_text.addWidget(self.lbl_hero_meta)
 
             h_sig_info.addLayout(v_sig_text, 1)
+
+            self.lbl_audio_fmt = QLabel("No Audio")
+            self.lbl_audio_fmt.setObjectName("audioFormat")
+            self.lbl_audio_fmt.setFixedHeight(26)
+            self.lbl_audio_fmt.setAlignment(Qt.AlignCenter)
+            self.lbl_audio_fmt.setToolTip(
+                "Audio format detected by the userspace engine from the "
+                "IT6805 / SDL2 stream log.")
+            h_sig_info.addWidget(self.lbl_audio_fmt, 0, Qt.AlignVCenter)
 
             self.lbl_engine_badge = QLabel(
                 "Userspace VFIO" if self.vfio_mode
@@ -3348,117 +3369,38 @@ if HAS_QT:
             if self.duo_mode:
                 self.video_canvas.port_requested.connect(
                     lambda p: self.combo_duo_input.setCurrentIndex(1 if p == 1 else 0) if hasattr(self, "combo_duo_input") else None)
-            v_hero.addWidget(self.video_canvas)
+            v_hero.addWidget(self.video_canvas, 1)
 
-            # Telemetry row: the detected audio format lives here instead of
-            # being buried in the settings form.
-            h_telemetry = QHBoxLayout()
-            h_telemetry.setSpacing(8)
-            self.lbl_audio_fmt = QLabel("No Audio")
-            self.lbl_audio_fmt.setObjectName("audioFormat")
-            self.lbl_audio_fmt.setFixedHeight(24)
-            self.lbl_audio_fmt.setAlignment(Qt.AlignCenter)
-            self.lbl_audio_fmt.setToolTip(
-                "Audio format detected by the userspace engine from the "
-                "IT6805 / SDL2 stream log.")
-            h_telemetry.addWidget(self.lbl_audio_fmt, 0, Qt.AlignVCenter)
-            h_telemetry.addStretch(1)
-
-            lbl_quick_preset = QLabel("Console Preset")
-            lbl_quick_preset.setObjectName("heroMeta")
-            h_telemetry.addWidget(lbl_quick_preset, 0, Qt.AlignVCenter)
-
-            self.combo_quick_preset = QComboBox()
-            if self.duo_mode:
-                self.combo_quick_preset.addItem("🎮 Auto (HDMI Native Sync)", "auto")
-                self.combo_quick_preset.addItem("📺 1080p Full HD (1920×1080)", "duo_1080p")
-                self.combo_quick_preset.addItem("⚡ 720p HD (1280×720)", "duo_720p")
-                self.combo_quick_preset.addItem("🕹️ Retro SD 480p / 576p (4:3 Integer)", "duo_retro")
-                self.combo_quick_preset.addItem("📼 1080i Broadcast (Interlaced)", "duo_1080i")
-                self.combo_quick_preset.setToolTip(
-                    "Live Gamer DUO Console Preset: synchronizes hardware capture with incoming console resolution and aspect ratio.")
-            else:
-                self.combo_quick_preset.addItem("🎮 Auto (Recommended)", "auto")
-                self.combo_quick_preset.addItem("📺 Modern Console (4K60 HDR)", "console_4k")
-                self.combo_quick_preset.addItem("⚡ Esports High Refresh (1440p120)", "esports_1440p")
-                self.combo_quick_preset.addItem("🕹️ Retro Gaming (1080p 4:3 Integer)", "retro_1080p")
-                self.combo_quick_preset.setToolTip(
-                    "Console Quick Preset: automatically configures optimal EDID, aspect ratio, HDR, and scaling.")
-            self.combo_quick_preset.currentIndexChanged.connect(self._on_quick_preset_changed)
-            h_telemetry.addWidget(self.combo_quick_preset, 0, Qt.AlignVCenter)
+            # Bottom toolbar for Hero Card: hardware controls & engine actions
+            h_hero_toolbar = QHBoxLayout()
+            h_hero_toolbar.setSpacing(8)
 
             if self.duo_mode:
                 lbl_duo = QLabel("DUO Input")
-                lbl_duo.setObjectName("heroMeta")
-                h_telemetry.addWidget(lbl_duo, 0, Qt.AlignVCenter)
+                lbl_duo.setObjectName("fieldLabel")
+                h_hero_toolbar.addWidget(lbl_duo, 0, Qt.AlignVCenter)
+
                 self.combo_duo_input = QComboBox()
                 self.combo_duo_input.addItem("HDMI 1", 0)
                 self.combo_duo_input.addItem("HDMI 2", 1)
-                saved_input = load_settings().get("duo_input", 0)
                 self.combo_duo_input.setCurrentIndex(1 if saved_input == 1 else 0)
                 self.combo_duo_input.setToolTip(
                     "Select which Live Gamer DUO HDMI input is shown in the "
                     "gaming window and primary capture stream.")
                 self.combo_duo_input.currentIndexChanged.connect(
                     self.on_duo_input_changed)
-                h_telemetry.addWidget(self.combo_duo_input, 0, Qt.AlignVCenter)
+                h_hero_toolbar.addWidget(self.combo_duo_input, 0, Qt.AlignVCenter)
 
-            v_hero.addLayout(h_telemetry)
+                btn_hpd = QPushButton("Pulse HPD")
+                btn_hpd.setObjectName("btnGhost")
+                btn_hpd.setCursor(Qt.PointingHandCursor)
+                btn_hpd.setMinimumHeight(32)
+                btn_hpd.setToolTip(
+                    "Re-trigger the HDMI hot-plug handshake on the selected input.")
+                btn_hpd.clicked.connect(self._duo_hpd_action)
+                h_hero_toolbar.addWidget(btn_hpd, 0, Qt.AlignVCenter)
 
-            # Runtime actions in one row: start/stop, studio, re-sync.
-            h_actions = QHBoxLayout()
-            h_actions.setSpacing(8)
-
-            self.btn_launch = QPushButton("Start Playing (UI Feed)")
-            self.btn_launch.setObjectName("btnLaunchStart")
-            self.btn_launch.setCursor(Qt.PointingHandCursor)
-            self.btn_launch.setMinimumHeight(38)
-            self.btn_launch.clicked.connect(self.toggle_stream)
-            h_actions.addWidget(self.btn_launch, 3)
-
-            self.btn_detached = QPushButton("⧉ Detached Window")
-            self.btn_detached.setObjectName("btnGhost")
-            self.btn_detached.setCursor(Qt.PointingHandCursor)
-            self.btn_detached.setMinimumHeight(38)
-            self.btn_detached.setToolTip(
-                "Launch the classic detached SDL2 floating window instead of the integrated UI player")
-            self.btn_detached.clicked.connect(self.start_detached_window)
-            h_actions.addWidget(self.btn_detached, 2)
-
-            self.btn_studio = QPushButton("Studio / OBS")
-            self.btn_studio.setObjectName("btnStudioStart")
-            self.btn_studio.setCursor(Qt.PointingHandCursor)
-            self.btn_studio.setMinimumHeight(38)
-            self.btn_studio.setToolTip(
-                "Runs the userspace engine headless and publishes native video & audio "
-                "to PipeWire, Userspace SHM (libgc570d-v4l2.so), and optional V4L2 for OBS/Discord.")
-            self.btn_studio.clicked.connect(self.toggle_studio)
-            if not self.vfio_mode:
-                self.btn_studio.setEnabled(False)
-                self.btn_studio.setToolTip(
-                    "Studio / headless mode requires the userspace VFIO engine.")
-            h_actions.addWidget(self.btn_studio, 2)
-
-            self.btn_resync = QPushButton(
-                "Restart Engine" if self.vfio_mode else "Re-sync")
-            self.btn_resync.setObjectName("btnGhost")
-            self.btn_resync.setCursor(Qt.PointingHandCursor)
-            self.btn_resync.setMinimumHeight(38)
-            self.btn_resync.setFixedWidth(130)
-            self.btn_resync.setToolTip(
-                "Restart the userspace VFIO engine. HDMI hot-switching is automatic."
-                if self.vfio_mode else
-                "Trigger hardware HDMI handshake (HPD pulse) - also key 'H' in window")
-            self.btn_resync.clicked.connect(self.force_resync)
-            h_actions.addWidget(self.btn_resync, 0)
-
-            v_hero.addLayout(h_actions)
-
-            if self.duo_mode:
-                v_hero.addSpacing(2)
-                h_duo = QHBoxLayout()
-                h_duo.setSpacing(8)
-                btn_bridge = QPushButton("EDID: Internal Bridge")
+                btn_bridge = QPushButton("EDID: Bridge")
                 btn_bridge.setObjectName("btnGhost")
                 btn_bridge.setCursor(Qt.PointingHandCursor)
                 btn_bridge.setMinimumHeight(32)
@@ -3467,8 +3409,9 @@ if HAS_QT:
                     "Required for standalone capture without a downstream TV.")
                 btn_bridge.clicked.connect(
                     lambda: self._duo_edid_action(True))
-                h_duo.addWidget(btn_bridge)
-                btn_copy = QPushButton("EDID: Downstream Copy")
+                h_hero_toolbar.addWidget(btn_bridge, 0, Qt.AlignVCenter)
+
+                btn_copy = QPushButton("EDID: Copy")
                 btn_copy.setObjectName("btnGhost")
                 btn_copy.setCursor(Qt.PointingHandCursor)
                 btn_copy.setMinimumHeight(32)
@@ -3476,19 +3419,24 @@ if HAS_QT:
                     "Copy the EDID of the display/AVR connected to HDMI OUT.")
                 btn_copy.clicked.connect(
                     lambda: self._duo_edid_action(False))
-                h_duo.addWidget(btn_copy)
-                btn_hpd = QPushButton("Pulse HPD")
-                btn_hpd.setObjectName("btnGhost")
-                btn_hpd.setCursor(Qt.PointingHandCursor)
-                btn_hpd.setMinimumHeight(32)
-                btn_hpd.setToolTip(
-                    "Re-trigger the HDMI hot-plug handshake on the selected input.")
-                btn_hpd.clicked.connect(self._duo_hpd_action)
-                h_duo.addWidget(btn_hpd)
-                h_duo.addStretch(1)
-                v_hero.addLayout(h_duo)
+                h_hero_toolbar.addWidget(btn_copy, 0, Qt.AlignVCenter)
 
-            root_layout.addWidget(card_hero)
+            h_hero_toolbar.addStretch(1)
+
+            self.btn_resync = QPushButton(
+                "Restart Engine" if self.vfio_mode else "Re-sync")
+            self.btn_resync.setObjectName("btnGhost")
+            self.btn_resync.setCursor(Qt.PointingHandCursor)
+            self.btn_resync.setMinimumHeight(32)
+            self.btn_resync.setToolTip(
+                "Restart the userspace VFIO engine. HDMI hot-switching is automatic."
+                if self.vfio_mode else
+                "Trigger hardware HDMI handshake (HPD pulse) - also key 'H' in window")
+            self.btn_resync.clicked.connect(self.force_resync)
+            h_hero_toolbar.addWidget(self.btn_resync, 0, Qt.AlignVCenter)
+
+            v_hero.addLayout(h_hero_toolbar)
+            root_layout.addWidget(card_hero, 2)
 
             # -------------------------------------------------------------
             # Settings: three calm, thematically grouped sections
@@ -3679,8 +3627,6 @@ if HAS_QT:
             self.combo_scale.currentIndexChanged.connect(self.on_scale_changed)
             grid_video.addWidget(self.combo_scale, 2, 1)
 
-            root_layout.addWidget(card_video)
-
             # --- Section: frame generation --------------------
             card_fg, grid_fg = _section(
                 "EXPERIMENTAL · LSFG-VK FRAME GENERATION")
@@ -3790,9 +3736,6 @@ if HAS_QT:
 
             if self.duo_mode:
                 card_fg.setVisible(False)
-
-            root_layout.addWidget(card_fg)
-
             # --- Section B: audio & hardware ----------------------------
             card_audio, grid_audio = _section("AUDIO & HARDWARE")
             grid_audio.setColumnMinimumWidth(0, 148)
@@ -3881,8 +3824,6 @@ if HAS_QT:
                         self.combo_led.setEnabled(False)
             self.combo_led.currentIndexChanged.connect(self.on_led_changed)
             grid_audio.addWidget(self.combo_led, 0, 3)
-
-            root_layout.addWidget(card_audio)
 
             # --- Section C: outputs, overlay & app ----------------------
             card_out, grid_out = _section("OBS OUTPUTS, OVERLAY & APP")
@@ -3999,7 +3940,58 @@ if HAS_QT:
                     "Clean feed: hides the on-screen stats overlay and the "
                     "mouse cursor in the game window (Tab/'o' toggles at runtime).")
 
-            root_layout.addWidget(card_out)
+            grid_out.addWidget(_field("Detached Window"), 4, 0)
+            self.btn_detached = QPushButton("⧉ Launch Detached SDL Window")
+            self.btn_detached.setObjectName("btnGhost")
+            self.btn_detached.setCursor(Qt.PointingHandCursor)
+            self.btn_detached.setMinimumHeight(32)
+            self.btn_detached.setToolTip(
+                "Launch the classic detached SDL2 floating window instead of the integrated UI player")
+            self.btn_detached.clicked.connect(self.start_detached_window)
+            grid_out.addWidget(self.btn_detached, 4, 1)
+
+            # Advanced Settings Scroll Area
+            self.scroll_advanced = QScrollArea()
+            self.scroll_advanced.setWidgetResizable(True)
+            self.scroll_advanced.setFrameShape(QFrame.NoFrame)
+            self.scroll_advanced.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.scroll_advanced.setStyleSheet("""
+                QScrollArea {
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar:vertical {
+                    background: #0e1116;
+                    width: 8px;
+                    margin: 0px;
+                    border-radius: 4px;
+                }
+                QScrollBar::handle:vertical {
+                    background: #2a3448;
+                    min-height: 20px;
+                    border-radius: 4px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: #3b82f6;
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
+                }
+            """)
+
+            scroll_content = QWidget()
+            scroll_content.setStyleSheet("background: transparent;")
+            v_advanced = QVBoxLayout(scroll_content)
+            v_advanced.setContentsMargins(0, 0, 0, 0)
+            v_advanced.setSpacing(10)
+
+            v_advanced.addWidget(card_video)
+            v_advanced.addWidget(card_fg)
+            v_advanced.addWidget(card_audio)
+            v_advanced.addWidget(card_out)
+
+            self.scroll_advanced.setWidget(scroll_content)
+            root_layout.addWidget(self.scroll_advanced, 1)
 
             # -------------------------------------------------------------
             # Footer: device path left, hotkeys right
@@ -4033,13 +4025,13 @@ if HAS_QT:
             lbl_hints.setObjectName("footerText")
             b_layout.addWidget(lbl_hints)
 
-            root_layout.addStretch(1)
             root_layout.addWidget(bottom_box)
 
             self.card_video = card_video
+            self.card_fg = card_fg
             self.card_audio = card_audio
             self.card_out = card_out
-            self._apply_pro_mode()
+            self._apply_advanced_mode()
 
             # Initial status poll
             self.update_status()
@@ -4047,104 +4039,32 @@ if HAS_QT:
             # System Tray Integration
             self._init_tray()
 
-        def toggle_pro_mode(self):
-            self.is_pro_mode = not self.is_pro_mode
-            self._apply_pro_mode()
-            save_settings({"ui_mode": "pro" if self.is_pro_mode else "simple"})
+        @property
+        def is_pro_mode(self):
+            return self.is_advanced_mode
 
-        def _apply_pro_mode(self):
-            if hasattr(self, "card_video") and hasattr(self, "card_out"):
-                self.card_video.setVisible(self.is_pro_mode)
-                self.card_out.setVisible(self.is_pro_mode)
-            if hasattr(self, "btn_pro_mode"):
-                self.btn_pro_mode.setText("Simple View ✕" if self.is_pro_mode else "Pro Settings ⚙")
-            target_h = (860 if self.duo_mode else 820) if self.is_pro_mode else (600 if self.duo_mode else 560)
+        @is_pro_mode.setter
+        def is_pro_mode(self, val):
+            self.is_advanced_mode = val
+
+        def toggle_advanced_mode(self):
+            self.is_advanced_mode = not self.is_advanced_mode
+            self._apply_advanced_mode()
+            save_settings({"ui_mode": "advanced" if self.is_advanced_mode else "simple"})
+
+        def _apply_advanced_mode(self):
+            if hasattr(self, "scroll_advanced"):
+                self.scroll_advanced.setVisible(self.is_advanced_mode)
+            if hasattr(self, "btn_advanced"):
+                self.btn_advanced.setText("Hide Advanced ✕" if self.is_advanced_mode else "Advanced ⚙")
+            target_h = (940 if self.duo_mode else 900) if self.is_advanced_mode else (680 if self.duo_mode else 640)
             self.resize(self.width(), target_h)
 
-        def _on_quick_preset_changed(self, index: int):
-            key = self.combo_quick_preset.itemData(index)
-            if key == "duo_1080p":
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("16:9")
-                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
-            elif key == "duo_720p":
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("16:9")
-                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
-            elif key == "duo_retro":
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("4:3")
-                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("integer")
-                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
-            elif key == "duo_1080i":
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("16:9")
-                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
-            elif key == "console_4k":
-                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
-                    idx = self.combo_presets.findData("default")
-                    if idx >= 0:
-                        self.combo_presets.setCurrentIndex(idx)
-                if hasattr(self, "chk_hdr"):
-                    self.chk_hdr.setChecked(True)
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("auto")
-                    if idx >= 0:
-                        self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0:
-                        self.combo_scale.setCurrentIndex(idx)
-            elif key == "esports_1440p":
-                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
-                    idx = self.combo_presets.findData("1440p120")
-                    if idx >= 0:
-                        self.combo_presets.setCurrentIndex(idx)
-                if hasattr(self, "chk_hdr"):
-                    self.chk_hdr.setChecked(False)
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("auto")
-                    if idx >= 0:
-                        self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0:
-                        self.combo_scale.setCurrentIndex(idx)
-            elif key == "retro_1080p":
-                if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
-                    idx = self.combo_presets.findData("1080p240")
-                    if idx >= 0:
-                        self.combo_presets.setCurrentIndex(idx)
-                if hasattr(self, "chk_hdr"):
-                    self.chk_hdr.setChecked(False)
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("4:3")
-                    if idx >= 0:
-                        self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("integer")
-                    if idx >= 0:
-                        self.combo_scale.setCurrentIndex(idx)
-            elif key == "auto":
-                if hasattr(self, "combo_aspect"):
-                    idx = self.combo_aspect.findData("auto")
-                    if idx >= 0:
-                        self.combo_aspect.setCurrentIndex(idx)
-                if hasattr(self, "combo_scale"):
-                    idx = self.combo_scale.findData("fit")
-                    if idx >= 0:
-                        self.combo_scale.setCurrentIndex(idx)
+        toggle_pro_mode = toggle_advanced_mode
+        _apply_pro_mode = _apply_advanced_mode
+
+        def _on_quick_preset_changed(self, index: int = 0):
+            pass
 
         def _set_launch_running(self, running: bool, mode: Optional[str] = None):
             if running:
@@ -4153,70 +4073,20 @@ if HAS_QT:
             else:
                 self._launch_mode = None
 
-            studio_idle_tip = (
-                "Runs the userspace engine headless and publishes native video & audio "
-                "to PipeWire, Userspace SHM (libgc570d-v4l2.so), and optional V4L2 for OBS/Discord."
-                if self.vfio_mode else
-                "Studio / headless mode requires the userspace VFIO engine.")
-
-            if self._launch_mode == "studio":
-                self.btn_launch.setText("Start Playing (UI Feed)")
-                self.btn_launch.setObjectName("btnLaunchStart")
-                self.btn_launch.setEnabled(True)
-                self.btn_detached.setText("⧉ Detached Window")
-                self.btn_detached.setObjectName("btnGhost")
-                self.btn_detached.setEnabled(True)
-                self.btn_studio.setText("Stop Studio")
-                self.btn_studio.setObjectName("btnStudioStop")
-                self.btn_studio.setEnabled(True)
-                self.btn_studio.setToolTip(
-                    "Stop the headless streamer and release the capture card.")
-            elif self._launch_mode == "detached":
-                self.btn_launch.setText("Switch to UI Feed")
-                self.btn_launch.setObjectName("btnLaunchSwitch")
-                self.btn_launch.setEnabled(True)
-                self.btn_detached.setText("Stop Detached Window")
-                self.btn_detached.setObjectName("btnStudioStop")
-                self.btn_detached.setEnabled(True)
-                self.btn_studio.setText("Studio / OBS")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(self.vfio_mode)
-            elif self._launch_mode == "gaming":
-                self.btn_launch.setText("Stop Playing")
-                self.btn_launch.setObjectName("btnLaunchStop")
-                self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip(
-                    "Stop capturing and release the capture card.")
-                self.btn_detached.setText("⧉ Open Detached")
-                self.btn_detached.setObjectName("btnGhost")
-                self.btn_detached.setEnabled(True)
-                self.btn_studio.setText("Studio / OBS")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(self.vfio_mode)
-                self.btn_studio.setToolTip(studio_idle_tip)
-            else:
-                self.btn_launch.setText("Start Playing (UI Feed)")
-                self.btn_launch.setObjectName("btnLaunchStart")
-                self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip("")
-                self.btn_detached.setText("⧉ Detached Window")
-                self.btn_detached.setObjectName("btnGhost")
-                self.btn_detached.setEnabled(True)
-                self.btn_studio.setText("Studio / OBS")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(self.vfio_mode)
-                self.btn_studio.setToolTip(studio_idle_tip)
-
-            for button in (self.btn_launch, self.btn_detached, self.btn_studio):
-                button.setStyle(button.style())
+            if hasattr(self, "btn_detached"):
+                if self._launch_mode == "detached":
+                    self.btn_detached.setText("Stop Detached Window")
+                else:
+                    self.btn_detached.setText("⧉ Launch Detached SDL Window")
+                self.btn_detached.setStyle(self.btn_detached.style())
 
             if hasattr(self, "lbl_engine_badge"):
-                if self._launch_mode == "studio":
-                    self.lbl_engine_badge.setText("Studio / Headless")
-                elif self._launch_mode == "detached":
+                if self._launch_mode == "detached":
                     self.lbl_engine_badge.setText("Detached Window")
-                elif self._launch_mode == "gaming":
-                    self.lbl_engine_badge.setText("Playing (UI Feed)")
+                elif self._launch_mode == "gaming" or self.streamer.is_running:
+                    self.lbl_engine_badge.setText("Userspace VFIO")
+                elif self.vfio_mode:
+                    self.lbl_engine_badge.setText("Userspace VFIO")
                 elif self.vfio_mode:
                     self.lbl_engine_badge.setText("Userspace VFIO")
                 else:
@@ -4256,19 +4126,16 @@ if HAS_QT:
                     f"Build it with: make -C tools/{folder}")
                 return False
             if self._remote or ipc_probe() is not None:
-                self._set_vfio_notice(
-                    "Remote Session",
-                    "Another streamer owns the capture card; close it to start "
-                    "a session from here",
-                    seconds=8.0)
-                return False
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                return True
             if _vfio_streamer_running():
-                engine = ("opengc570d-userd" if self.duo_mode
-                          else "gc573_user_streamer")
-                self._set_vfio_notice(
-                    "Userspace Engine Active",
-                    f"An external {engine} instance already owns the device")
-                return False
+                # Userspace streamer is already active and owns the card; attach to it
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                return True
             return True
 
         # -----------------------------------------------------------------
@@ -4313,21 +4180,8 @@ if HAS_QT:
             if remote:
                 if hasattr(self, "lbl_engine_badge"):
                     self.lbl_engine_badge.setText("● Remote Session")
-                self.btn_launch.setText("Remote Session Active")
-                self.btn_launch.setObjectName("btnLaunchStart")
-                self.btn_launch.setEnabled(False)
-                self.btn_launch.setToolTip(
-                    "A userspace streamer started outside this window owns "
-                    "the capture card.")
-                self.btn_studio.setText("Start Studio / Headless (OBS)")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(False)
-                self.btn_studio.setToolTip(
-                    "Stop the external streamer to start a session from here.")
-                for button in (self.btn_launch, self.btn_studio):
-                    button.setStyle(button.style())
-                # The LED, volume and aspect controls stay live: they now talk
-                # to the running engine over the control socket.
+                if hasattr(self, "btn_detached"):
+                    self.btn_detached.setEnabled(False)
                 if hasattr(self, "combo_led"):
                     self.combo_led.setEnabled(True)
                 self._set_vfio_notice(
@@ -4337,6 +4191,8 @@ if HAS_QT:
             else:
                 if hasattr(self, "lbl_engine_badge") and self.vfio_mode:
                     self.lbl_engine_badge.setText("Userspace VFIO")
+                if hasattr(self, "btn_detached"):
+                    self.btn_detached.setEnabled(True)
                 self._set_launch_running(False)
 
         def _poll_remote_status(self):
@@ -4611,24 +4467,15 @@ if HAS_QT:
             if hasattr(self, "lbl_engine_badge"):
                 self.lbl_engine_badge.setText("Switching Mode…")
 
-            self.btn_launch.setEnabled(False)
-            self.btn_studio.setEnabled(False)
             if hasattr(self, "btn_detached"):
                 self.btn_detached.setEnabled(False)
 
-            if target == "studio":
-                self.btn_studio.setText("Switching to Studio…")
-                self._set_vfio_notice(
-                    "Switching to Studio",
-                    "Closing display presentation; OBS feed keeps running",
-                    seconds=5.0)
-            elif target == "detached":
+            if target == "detached":
                 self._set_vfio_notice(
                     "Opening Detached Window",
                     "Launching external SDL2 floating presentation",
                     seconds=5.0)
             else:
-                self.btn_launch.setText("Switching to UI Feed…")
                 self._set_vfio_notice(
                     "Switching to UI Feed",
                     "Displaying video directly inside Console Hub",
