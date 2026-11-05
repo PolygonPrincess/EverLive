@@ -8,7 +8,7 @@ GC570D_DIR := ../tools/opengc570d-userd/src
 GC573_DIR := ../tools/opengc573-userd
 CORE_DIR := ../tools/libeverlive-core
 
-TARGETS := test_edid test_config test_framegen test_ipc_json test_edid_unifier test_card_registry
+TARGETS := test_edid test_config test_framegen test_ipc_json test_edid_unifier test_card_registry test_frame_convert
 
 all: $(TARGETS)
 
@@ -30,6 +30,9 @@ test_edid_unifier: test_edid_unifier.c
 test_card_registry: test_card_registry.c $(CORE_DIR)/everlive_card.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
+test_frame_convert: test_frame_convert.c $(CORE_DIR)/everlive_frame.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
+
 asan: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 asan: all
 
@@ -41,6 +44,7 @@ test: all
 	@./test_ipc_json
 	@./test_edid_unifier
 	@./test_card_registry
+	@./test_frame_convert
 
 clean:
 	rm -f $(TARGETS)

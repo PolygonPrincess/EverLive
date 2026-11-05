@@ -14,7 +14,16 @@ import argparse
 import re
 import json
 import shutil
+import mmap
+import ctypes
+import struct
 from typing import Optional, Tuple, Dict
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 try:
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
@@ -482,10 +491,10 @@ try:
         QGroupBox, QMessageBox, QStackedLayout, QSizePolicy, QFileDialog,
         QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox
     )
-    from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize
+    from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize, QRect, QPoint
     from PySide6.QtGui import (
         QGuiApplication, QFont, QIcon, QColor, QPalette, QKeySequence, QShortcut,
-        QDesktopServices, QPixmap, QPainter, QAction
+        QDesktopServices, QPixmap, QPainter, QAction, QImage, QPen, QBrush, QCursor
     )
     HAS_QT = True
 except ImportError:
@@ -2151,6 +2160,434 @@ class GameStreamer:
 
 
 if HAS_QT:
+    SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
+    SHM_MAGIC = 0x47433537  # "GC57"
+    SHM_HEADER_SIZE = 40
+    SHM_PORT_HEADER_SIZE = 32
+    SHM_FRAME_BYTES = 1920 * 1080 * 2
+    SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_FRAME_BYTES
+
+    _lib_core = None
+    try:
+        _core_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "libeverlive-core", "libeverlive_core.so")
+        if os.path.isfile(_core_path):
+            _lib_core = ctypes.CDLL(_core_path)
+            _lib_core.everlive_yuy2_to_rgb.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+            _lib_core.everlive_yuy2_to_rgb_scaled.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    except Exception:
+        _lib_core = None
+
+    class EmbeddedVideoCanvas(QWidget):
+        """Zero-latency embedded live video canvas for EverLive Console Hub.
+
+        Reads frames directly from userspace shared memory (/dev/shm/gc570d_v4l2_shm),
+        converts via SIMD-accelerated C or NumPy fixed-point, renders with aspect ratio
+        correction and letterboxing, and supports 1-click borderless fullscreen.
+        """
+        fullscreen_requested = Signal()
+        toggle_play_requested = Signal()
+
+        def __init__(self, parent=None, duo_mode: bool = False):
+            super().__init__(parent)
+            self.duo_mode = duo_mode
+            self.port = 0
+            self.aspect = "auto"
+            self.scale_mode = "fit"
+
+            self.is_streaming = False
+            self.has_signal = False
+            self.current_width = 1920
+            self.current_height = 1080
+            self.signal_desc = "Standby"
+
+            self._current_qimage = None
+            self._rgb_buffer = None
+            self._last_seq = 0
+            self._shm_file = None
+            self._shm_mmap = None
+            self._hover_fs = False
+            self._fs_btn_rect = QRect()
+
+            self.setMouseTracking(True)
+            self.setCursor(Qt.PointingHandCursor)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setMinimumHeight(280)
+            self.setStyleSheet("background-color: #0b0e14; border-radius: 8px;")
+
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.poll_frame)
+            self.timer.start(16)
+
+        def set_port(self, port: int):
+            self.port = 1 if port == 1 else 0
+            self._last_seq = 0
+            self.update()
+
+        def set_aspect(self, aspect: str):
+            self.aspect = aspect or "auto"
+            self.update()
+
+        def set_scale_mode(self, scale: str):
+            self.scale_mode = scale or "fit"
+            self.update()
+
+        def poll_frame(self):
+            if self._shm_mmap is None:
+                if not os.path.exists(SHM_NAME):
+                    if self.is_streaming:
+                        self.is_streaming = False
+                        self.has_signal = False
+                        self._current_qimage = None
+                        self.update()
+                    return
+                try:
+                    self._shm_file = open(SHM_NAME, "r+b")
+                    self._shm_mmap = mmap.mmap(
+                        self._shm_file.fileno(), 0, prot=mmap.PROT_READ)
+                except Exception:
+                    self._shm_file = None
+                    self._shm_mmap = None
+                    return
+
+            try:
+                magic = struct.unpack_from("<I", self._shm_mmap, 0)[0]
+                if magic != SHM_MAGIC:
+                    return
+
+                port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
+                seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                if seq & 1 != 0:
+                    return
+                if seq == self._last_seq and self._current_qimage is not None:
+                    return
+
+                width, height, no_signal, streaming = struct.unpack_from(
+                    "<IIII", self._shm_mmap, port_off + 16)
+                if streaming == 0:
+                    if self.is_streaming:
+                        self.is_streaming = False
+                        self.has_signal = False
+                        self._current_qimage = None
+                        self.update()
+                    return
+
+                self.is_streaming = True
+                if no_signal != 0 or width == 0 or height == 0:
+                    if self.has_signal or self._current_qimage is not None:
+                        self.has_signal = False
+                        self._current_qimage = None
+                        self.signal_desc = f"No HDMI Signal (Port {self.port + 1})"
+                        self.update()
+                    return
+
+                self.has_signal = True
+                self.current_width = width
+                self.current_height = height
+                self.signal_desc = f"{width}×{height} @ 60 Hz"
+
+                payload_len = width * height * 2
+                yuy2_off = port_off + 32
+                yuy2_slice = memoryview(self._shm_mmap)[yuy2_off : yuy2_off + payload_len]
+
+                post_seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                if post_seq != seq:
+                    return
+
+                rgb_len = width * height * 3
+                if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_len:
+                    self._rgb_buffer = bytearray(rgb_len)
+
+                if _lib_core is not None:
+                    src_ptr = (ctypes.c_char * payload_len).from_buffer(yuy2_slice)
+                    dst_ptr = (ctypes.c_char * rgb_len).from_buffer(self._rgb_buffer)
+                    _lib_core.everlive_yuy2_to_rgb(src_ptr, dst_ptr, width, height)
+                    qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
+                elif HAS_NUMPY:
+                    raw = np.frombuffer(yuy2_slice, dtype=np.uint8).reshape((height, width, 2))
+                    y = raw[:, :, 0].astype(np.int32)
+                    u = np.repeat(raw[:, 0::2, 1], 2, axis=1).astype(np.int32) - 128
+                    v = np.repeat(raw[:, 1::2, 1], 2, axis=1).astype(np.int32) - 128
+                    r = np.clip(y + ((359 * v) >> 8), 0, 255).astype(np.uint8)
+                    g = np.clip(y - ((88 * u + 183 * v) >> 8), 0, 255).astype(np.uint8)
+                    b = np.clip(y + ((454 * u) >> 8), 0, 255).astype(np.uint8)
+                    rgb_arr = np.ascontiguousarray(np.dstack((r, g, b)))
+                    qimg = QImage(rgb_arr.data, width, height, width * 3, QImage.Format_RGB888).copy()
+                else:
+                    return
+
+                self._last_seq = seq
+                self._current_qimage = qimg
+                self.update()
+            except Exception:
+                if self._shm_mmap:
+                    try: self._shm_mmap.close()
+                    except Exception: pass
+                    self._shm_mmap = None
+                if self._shm_file:
+                    try: self._shm_file.close()
+                    except Exception: pass
+                    self._shm_file = None
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            w = self.width()
+            h = self.height()
+            painter.fillRect(0, 0, w, h, QColor("#0a0d14"))
+
+            if (self._current_qimage and not self._current_qimage.isNull() and
+                    self.is_streaming and self.has_signal):
+                img_w = self._current_qimage.width()
+                img_h = self._current_qimage.height()
+
+                if self.aspect == "4:3":
+                    target_ratio = 4.0 / 3.0
+                elif self.aspect == "16:9":
+                    target_ratio = 16.0 / 9.0
+                elif self.aspect == "stretch":
+                    target_ratio = float(w) / float(h if h > 0 else 1)
+                else:
+                    target_ratio = float(img_w) / float(img_h if img_h > 0 else 1)
+
+                canvas_ratio = float(w) / float(h if h > 0 else 1)
+                if self.scale_mode == "integer":
+                    mult = max(1, min(w // img_w, h // img_h)) if (img_w > 0 and img_h > 0) else 1
+                    dw = img_w * mult
+                    dh = img_h * mult
+                    dx = (w - dw) // 2
+                    dy = (h - dh) // 2
+                    target_rect = QRect(dx, dy, dw, dh)
+                else:
+                    if canvas_ratio > target_ratio:
+                        dh = h
+                        dw = int(dh * target_ratio)
+                        dx = (w - dw) // 2
+                        dy = 0
+                    else:
+                        dw = w
+                        dh = int(dw / target_ratio)
+                        dx = 0
+                        dy = (h - dh) // 2
+                    target_rect = QRect(dx, dy, dw, dh)
+
+                painter.drawImage(target_rect, self._current_qimage)
+
+                # Top-left signal badge
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(15, 20, 30, 195))
+                painter.drawRoundedRect(12, 12, 185, 28, 6, 6)
+                painter.setPen(QColor("#7fd1ad"))
+                painter.setFont(QFont("sans-serif", 9, QFont.Bold))
+                port_name = f"HDMI {self.port + 1}" if self.duo_mode else "HDMI Live"
+                painter.drawText(22, 30, f"● {port_name} · {self.signal_desc}")
+            else:
+                painter.setPen(QPen(QColor("#1e2738"), 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(1, 1, w - 2, h - 2, 8, 8)
+
+                painter.setPen(QColor("#5c6880"))
+                painter.setFont(QFont("sans-serif", 28))
+                painter.drawText(QRect(0, h // 2 - 64, w, 44), Qt.AlignCenter, "🎮")
+
+                if self.is_streaming and not self.has_signal:
+                    title = f"No HDMI Signal on HDMI {self.port + 1}" if self.duo_mode else "No HDMI Signal"
+                    subtitle = "Power on console or connect HDMI source to display feed"
+                else:
+                    title = "EverLive Live Console Display"
+                    subtitle = "Click [ Start Playing ] or double-click here to view live feed"
+
+                painter.setPen(QColor("#e6e9ef"))
+                painter.setFont(QFont("sans-serif", 13, QFont.Bold))
+                painter.drawText(QRect(0, h // 2 - 16, w, 24), Qt.AlignCenter, title)
+
+                painter.setPen(QColor("#8a94a6"))
+                painter.setFont(QFont("sans-serif", 10))
+                painter.drawText(QRect(0, h // 2 + 12, w, 20), Qt.AlignCenter, subtitle)
+
+            # Top-right hover button
+            btn_w, btn_h = 135, 28
+            btn_x = w - btn_w - 14
+            btn_y = 12
+            self._fs_btn_rect = QRect(btn_x, btn_y, btn_w, btn_h)
+
+            btn_bg = QColor(43, 79, 110, 230) if self._hover_fs else QColor(26, 32, 48, 195)
+            btn_border = QColor(70, 88, 122) if self._hover_fs else QColor(42, 50, 66)
+            painter.setPen(QPen(btn_border, 1))
+            painter.setBrush(btn_bg)
+            painter.drawRoundedRect(self._fs_btn_rect, 6, 6)
+
+            painter.setPen(QColor("#ffffff" if self._hover_fs else "#d7dde8"))
+            painter.setFont(QFont("sans-serif", 9, QFont.Bold))
+            painter.drawText(self._fs_btn_rect, Qt.AlignCenter, "⛶ Fullscreen (F)")
+
+        def mouseMoveEvent(self, event):
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            hover = self._fs_btn_rect.contains(pos)
+            if hover != self._hover_fs:
+                self._hover_fs = hover
+                self.update()
+
+        def mousePressEvent(self, event):
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if self._fs_btn_rect.contains(pos):
+                self.fullscreen_requested.emit()
+            elif not self.is_streaming:
+                self.toggle_play_requested.emit()
+
+        def mouseDoubleClickEvent(self, event):
+            self.fullscreen_requested.emit()
+
+    class FullscreenVideoWindow(QWidget):
+        """Borderless edge-to-edge fullscreen presentation window."""
+        def __init__(self, canvas: EmbeddedVideoCanvas, main_window):
+            super().__init__()
+            self.canvas = canvas
+            self.main_window = main_window
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+            self.setStyleSheet("background-color: #000000;")
+            self.setWindowTitle("EverLive Fullscreen")
+
+            self.cursor_timer = QTimer(self)
+            self.cursor_timer.setSingleShot(True)
+            self.cursor_timer.timeout.connect(self._hide_osd)
+
+            self.osd_visible = True
+            self.setMouseTracking(True)
+
+            self.osd_bar = QFrame(self)
+            self.osd_bar.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(14, 19, 29, 220);
+                    border: 1px solid #2a3448;
+                    border-radius: 8px;
+                }
+            """)
+            h_osd = QHBoxLayout(self.osd_bar)
+            h_osd.setContentsMargins(14, 6, 14, 6)
+            h_osd.setSpacing(10)
+
+            self.lbl_info = QLabel("HDMI Feed")
+            self.lbl_info.setStyleSheet(
+                "color: #7fd1ad; font-weight: bold; font-size: 12px; border: none; background: transparent;")
+            h_osd.addWidget(self.lbl_info)
+
+            h_osd.addStretch(1)
+
+            btn_aspect = QPushButton("Aspect")
+            btn_aspect.setStyleSheet(
+                "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 4px 10px; border-radius: 4px;")
+            btn_aspect.clicked.connect(self._cycle_aspect)
+            h_osd.addWidget(btn_aspect)
+
+            btn_exit = QPushButton("✕ Exit Fullscreen (Esc)")
+            btn_exit.setStyleSheet(
+                "background: #2b4f6e; color: #ffffff; border: 1px solid #38658c; padding: 4px 12px; font-weight: bold; border-radius: 4px;")
+            btn_exit.clicked.connect(self.close)
+            h_osd.addWidget(btn_exit)
+
+            self.rep_timer = QTimer(self)
+            self.rep_timer.timeout.connect(self.update)
+            self.rep_timer.start(16)
+
+        def _cycle_aspect(self):
+            order = ["auto", "16:9", "4:3", "stretch"]
+            cur = getattr(self.canvas, "aspect", "auto")
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "auto"
+            self.canvas.set_aspect(nxt)
+            if hasattr(self.main_window, "combo_aspect"):
+                idx = self.main_window.combo_aspect.findData(nxt)
+                if idx >= 0:
+                    self.main_window.combo_aspect.blockSignals(True)
+                    self.main_window.combo_aspect.setCurrentIndex(idx)
+                    self.main_window.combo_aspect.blockSignals(False)
+            self.update()
+
+        def _hide_osd(self):
+            self.osd_visible = False
+            self.osd_bar.setVisible(False)
+            self.setCursor(Qt.BlankCursor)
+
+        def mouseMoveEvent(self, event):
+            if not self.osd_visible:
+                self.osd_visible = True
+                self.osd_bar.setVisible(True)
+                self.unsetCursor()
+            self.cursor_timer.start(2500)
+
+        def keyPressEvent(self, event):
+            key = event.key()
+            if key in (Qt.Key_Escape, Qt.Key_F, Qt.Key_F11, Qt.Key_Q):
+                self.close()
+            elif key == Qt.Key_A:
+                self._cycle_aspect()
+
+        def mouseDoubleClickEvent(self, event):
+            self.close()
+
+        def resizeEvent(self, event):
+            w = self.width()
+            h = self.height()
+            bar_w = min(560, w - 40)
+            self.osd_bar.setGeometry((w - bar_w) // 2, h - 56, bar_w, 42)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            w = self.width()
+            h = self.height()
+            painter.fillRect(0, 0, w, h, Qt.black)
+
+            qimg = self.canvas._current_qimage
+            if (qimg and not qimg.isNull() and
+                    self.canvas.is_streaming and self.canvas.has_signal):
+                img_w = qimg.width()
+                img_h = qimg.height()
+                aspect = getattr(self.canvas, "aspect", "auto")
+                scale_mode = getattr(self.canvas, "scale_mode", "fit")
+
+                if aspect == "4:3":
+                    target_ratio = 4.0 / 3.0
+                elif aspect == "16:9":
+                    target_ratio = 16.0 / 9.0
+                elif aspect == "stretch":
+                    target_ratio = float(w) / float(h if h > 0 else 1)
+                else:
+                    target_ratio = float(img_w) / float(img_h if img_h > 0 else 1)
+
+                canvas_ratio = float(w) / float(h if h > 0 else 1)
+                if scale_mode == "integer":
+                    mult = max(1, min(w // img_w, h // img_h)) if (img_w > 0 and img_h > 0) else 1
+                    dw = img_w * mult
+                    dh = img_h * mult
+                    dx = (w - dw) // 2
+                    dy = (h - dh) // 2
+                else:
+                    if canvas_ratio > target_ratio:
+                        dh = h
+                        dw = int(dh * target_ratio)
+                        dx = (w - dw) // 2
+                        dy = 0
+                    else:
+                        dw = w
+                        dh = int(dw / target_ratio)
+                        dx = 0
+                        dy = (h - dh) // 2
+                painter.drawImage(QRect(dx, dy, dw, dh), qimg)
+                self.lbl_info.setText(
+                    f"{self.canvas.signal_desc} · Aspect: {aspect.upper()}")
+            else:
+                painter.setPen(QColor("#7fd1ad"))
+                painter.setFont(QFont("sans-serif", 16, QFont.Bold))
+                painter.drawText(
+                    QRect(0, 0, w, h), Qt.AlignCenter, "Waiting for HDMI Stream...")
+
     class MainWindow(QMainWindow):
         def __init__(self, streamer: GameStreamer, vsync: bool = True, streamer_mode: bool = False,
                      headless_start: bool = False, v4l2_device: Optional[str] = None):
@@ -2184,7 +2621,10 @@ if HAS_QT:
             if not self.vfio_mode and self.saved_cfg.get("engine", "native") == "mpv":
                 self.streamer.force_mpv = True
 
+            self._fullscreen_window = None
             self.init_ui()
+            QShortcut(QKeySequence("F"), self, self.toggle_fullscreen)
+            QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
 
             if v4l2_device:
                 self.chk_v4l2.setChecked(True)
@@ -2221,8 +2661,10 @@ if HAS_QT:
 
         def init_ui(self):
             self.setWindowTitle("EverLive - Console Hub")
-            # Compact console-hub layout: sized so cards never squash
-            self.setFixedWidth(920)
+            # Compact console-hub layout: sized so the cards below never
+            # squash on Live Gamer DUO (with secondary action bar) or GC573.
+            self.setMinimumSize(920, 680)
+            self.resize(920, 860 if self.duo_mode else 820)
 
             # Application & Window Icon
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "everlive.png")
@@ -2845,6 +3287,14 @@ if HAS_QT:
 
             v_hero.addLayout(h_sig_info)
 
+            # Embedded Live Video Feed Canvas
+            self.video_canvas = EmbeddedVideoCanvas(self, duo_mode=self.duo_mode)
+            saved_input = load_settings().get("duo_input", 0)
+            self.video_canvas.set_port(saved_input)
+            self.video_canvas.fullscreen_requested.connect(self.toggle_fullscreen)
+            self.video_canvas.toggle_play_requested.connect(self.toggle_stream)
+            v_hero.addWidget(self.video_canvas)
+
             # Telemetry row: the detected audio format lives here instead of
             # being buried in the settings form.
             h_telemetry = QHBoxLayout()
@@ -2864,12 +3314,21 @@ if HAS_QT:
             h_telemetry.addWidget(lbl_quick_preset, 0, Qt.AlignVCenter)
 
             self.combo_quick_preset = QComboBox()
-            self.combo_quick_preset.addItem("🎮 Auto (Recommended)", "auto")
-            self.combo_quick_preset.addItem("📺 Modern Console (4K60 HDR)", "console_4k")
-            self.combo_quick_preset.addItem("⚡ Esports High Refresh (1440p120)", "esports_1440p")
-            self.combo_quick_preset.addItem("🕹️ Retro Gaming (1080p 4:3 Integer)", "retro_1080p")
-            self.combo_quick_preset.setToolTip(
-                "Console Quick Preset: automatically configures optimal EDID, aspect ratio, HDR, and scaling.")
+            if self.duo_mode:
+                self.combo_quick_preset.addItem("🎮 Auto (HDMI Native Sync)", "auto")
+                self.combo_quick_preset.addItem("📺 1080p Full HD (1920×1080)", "duo_1080p")
+                self.combo_quick_preset.addItem("⚡ 720p HD (1280×720)", "duo_720p")
+                self.combo_quick_preset.addItem("🕹️ Retro SD 480p / 576p (4:3 Integer)", "duo_retro")
+                self.combo_quick_preset.addItem("📼 1080i Broadcast (Interlaced)", "duo_1080i")
+                self.combo_quick_preset.setToolTip(
+                    "Live Gamer DUO Console Preset: synchronizes hardware capture with incoming console resolution and aspect ratio.")
+            else:
+                self.combo_quick_preset.addItem("🎮 Auto (Recommended)", "auto")
+                self.combo_quick_preset.addItem("📺 Modern Console (4K60 HDR)", "console_4k")
+                self.combo_quick_preset.addItem("⚡ Esports High Refresh (1440p120)", "esports_1440p")
+                self.combo_quick_preset.addItem("🕹️ Retro Gaming (1080p 4:3 Integer)", "retro_1080p")
+                self.combo_quick_preset.setToolTip(
+                    "Console Quick Preset: automatically configures optimal EDID, aspect ratio, HDR, and scaling.")
             self.combo_quick_preset.currentIndexChanged.connect(self._on_quick_preset_changed)
             h_telemetry.addWidget(self.combo_quick_preset, 0, Qt.AlignVCenter)
 
@@ -2895,14 +3354,23 @@ if HAS_QT:
             h_actions = QHBoxLayout()
             h_actions.setSpacing(8)
 
-            self.btn_launch = QPushButton("Start Gaming Screen")
+            self.btn_launch = QPushButton("Start Playing (UI Feed)")
             self.btn_launch.setObjectName("btnLaunchStart")
             self.btn_launch.setCursor(Qt.PointingHandCursor)
             self.btn_launch.setMinimumHeight(38)
             self.btn_launch.clicked.connect(self.toggle_stream)
             h_actions.addWidget(self.btn_launch, 3)
 
-            self.btn_studio = QPushButton("Start Studio / Headless (OBS)")
+            self.btn_detached = QPushButton("⧉ Detached Window")
+            self.btn_detached.setObjectName("btnGhost")
+            self.btn_detached.setCursor(Qt.PointingHandCursor)
+            self.btn_detached.setMinimumHeight(38)
+            self.btn_detached.setToolTip(
+                "Launch the classic detached SDL2 floating window instead of the integrated UI player")
+            self.btn_detached.clicked.connect(self.start_detached_window)
+            h_actions.addWidget(self.btn_detached, 2)
+
+            self.btn_studio = QPushButton("Studio / OBS")
             self.btn_studio.setObjectName("btnStudioStart")
             self.btn_studio.setCursor(Qt.PointingHandCursor)
             self.btn_studio.setMinimumHeight(38)
@@ -2921,7 +3389,7 @@ if HAS_QT:
             self.btn_resync.setObjectName("btnGhost")
             self.btn_resync.setCursor(Qt.PointingHandCursor)
             self.btn_resync.setMinimumHeight(38)
-            self.btn_resync.setFixedWidth(148)
+            self.btn_resync.setFixedWidth(130)
             self.btn_resync.setToolTip(
                 "Restart the userspace VFIO engine. HDMI hot-switching is automatic."
                 if self.vfio_mode else
@@ -3004,7 +3472,27 @@ if HAS_QT:
                 0, 0)
 
             self.combo_presets = QComboBox()
-            if self.vfio_mode:
+            if self.duo_mode:
+                duo_formats = [
+                    ("Auto (HDMI Native Sync)", "auto"),
+                    ("1080p @ 60 FPS (1920×1080)", "1080p60"),
+                    ("1080p @ 50 FPS (PAL)", "1080p50"),
+                    ("1080p @ 30 FPS", "1080p30"),
+                    ("1080p @ 24 FPS (Cinema)", "1080p24"),
+                    ("1080i @ 60/50 FPS (Interlaced)", "1080i"),
+                    ("720p @ 60 FPS (1280×720)", "720p60"),
+                    ("720p @ 50 FPS (PAL)", "720p50"),
+                    ("720x576 @ 50 FPS (576p PAL)", "576p"),
+                    ("720x480 @ 60 FPS (480p NTSC)", "480p"),
+                    ("640x480 @ 60 FPS (VGA)", "640x480"),
+                ]
+                for text, key in duo_formats:
+                    self.combo_presets.addItem(text, key)
+                self.combo_presets.setEnabled(True)
+                self.combo_presets.setToolTip(
+                    "Hardware capture modes supported by Live Gamer DUO. "
+                    "In Auto mode, the card automatically locks onto the incoming HDMI clock and timing.")
+            elif self.vfio_mode:
                 for text, key in EDID_PROFILES:
                     self.combo_presets.addItem(text, key)
                 saved_profile = self.saved_cfg.get("edid_profile", "default")
@@ -3032,11 +3520,6 @@ if HAS_QT:
             # activated (not currentIndexChanged) so re-picking the custom
             # entry opens the file dialog again.
             self.combo_presets.activated.connect(self.on_preset_changed)
-            if self.duo_mode:
-                self.combo_presets.setEnabled(False)
-                self.combo_presets.setToolTip(
-                    "The Live Gamer DUO selects the EDID policy with the "
-                    "Internal Bridge / Downstream Copy buttons above.")
             grid_video.addWidget(self.combo_presets, 0, 1)
 
             grid_video.addWidget(_field(
@@ -3520,12 +4003,40 @@ if HAS_QT:
                 self.card_out.setVisible(self.is_pro_mode)
             if hasattr(self, "btn_pro_mode"):
                 self.btn_pro_mode.setText("Simple View ✕" if self.is_pro_mode else "Pro Settings ⚙")
-            target_h = (856 if self.duo_mode else 800) if self.is_pro_mode else (520 if self.duo_mode else 480)
-            self.setFixedSize(920, target_h)
+            target_h = (860 if self.duo_mode else 820) if self.is_pro_mode else (600 if self.duo_mode else 560)
+            self.resize(self.width(), target_h)
 
         def _on_quick_preset_changed(self, index: int):
             key = self.combo_quick_preset.itemData(index)
-            if key == "console_4k":
+            if key == "duo_1080p":
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("16:9")
+                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
+            elif key == "duo_720p":
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("16:9")
+                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
+            elif key == "duo_retro":
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("4:3")
+                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("integer")
+                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
+            elif key == "duo_1080i":
+                if hasattr(self, "combo_aspect"):
+                    idx = self.combo_aspect.findData("16:9")
+                    if idx >= 0: self.combo_aspect.setCurrentIndex(idx)
+                if hasattr(self, "combo_scale"):
+                    idx = self.combo_scale.findData("fit")
+                    if idx >= 0: self.combo_scale.setCurrentIndex(idx)
+            elif key == "console_4k":
                 if hasattr(self, "combo_presets") and self.vfio_mode and not self.duo_mode:
                     idx = self.combo_presets.findData("default")
                     if idx >= 0:
@@ -3594,50 +4105,63 @@ if HAS_QT:
                 "Studio / headless mode requires the userspace VFIO engine.")
 
             if self._launch_mode == "studio":
-                # Studio keeps capturing; the gaming window can be opened on
-                # top of the running headless engine without dropping OBS.
-                self.btn_launch.setText("Switch to Gaming Screen")
-                self.btn_launch.setObjectName("btnLaunchSwitch")
+                self.btn_launch.setText("Start Playing (UI Feed)")
+                self.btn_launch.setObjectName("btnLaunchStart")
                 self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip(
-                    "Seamlessly open the interactive SDL2 gaming window "
-                    "(background capture to OBS remains uninterrupted).")
+                self.btn_detached.setText("⧉ Detached Window")
+                self.btn_detached.setObjectName("btnGhost")
+                self.btn_detached.setEnabled(True)
                 self.btn_studio.setText("Stop Studio")
                 self.btn_studio.setObjectName("btnStudioStop")
                 self.btn_studio.setEnabled(True)
                 self.btn_studio.setToolTip(
                     "Stop the headless streamer and release the capture card.")
+            elif self._launch_mode == "detached":
+                self.btn_launch.setText("Switch to UI Feed")
+                self.btn_launch.setObjectName("btnLaunchSwitch")
+                self.btn_launch.setEnabled(True)
+                self.btn_detached.setText("Stop Detached Window")
+                self.btn_detached.setObjectName("btnStudioStop")
+                self.btn_detached.setEnabled(True)
+                self.btn_studio.setText("Studio / OBS")
+                self.btn_studio.setObjectName("btnStudioStart")
+                self.btn_studio.setEnabled(self.vfio_mode)
             elif self._launch_mode == "gaming":
-                self.btn_launch.setText("Stop Gaming Screen")
+                self.btn_launch.setText("Stop Playing")
                 self.btn_launch.setObjectName("btnLaunchStop")
                 self.btn_launch.setEnabled(True)
                 self.btn_launch.setToolTip(
-                    "Close the gaming window and stop the streamer.")
-                self.btn_studio.setText("Switch to Studio (Headless)")
-                self.btn_studio.setObjectName("btnStudioSwitch")
+                    "Stop capturing and release the capture card.")
+                self.btn_detached.setText("⧉ Open Detached")
+                self.btn_detached.setObjectName("btnGhost")
+                self.btn_detached.setEnabled(True)
+                self.btn_studio.setText("Studio / OBS")
+                self.btn_studio.setObjectName("btnStudioStart")
                 self.btn_studio.setEnabled(self.vfio_mode)
-                self.btn_studio.setToolTip(
-                    "Seamlessly close the gaming window and continue streaming "
-                    "native frames in the background for OBS."
-                    if self.vfio_mode else studio_idle_tip)
+                self.btn_studio.setToolTip(studio_idle_tip)
             else:
-                self.btn_launch.setText("Start Gaming Screen")
+                self.btn_launch.setText("Start Playing (UI Feed)")
                 self.btn_launch.setObjectName("btnLaunchStart")
                 self.btn_launch.setEnabled(True)
                 self.btn_launch.setToolTip("")
-                self.btn_studio.setText("Start Studio / Headless (OBS)")
+                self.btn_detached.setText("⧉ Detached Window")
+                self.btn_detached.setObjectName("btnGhost")
+                self.btn_detached.setEnabled(True)
+                self.btn_studio.setText("Studio / OBS")
                 self.btn_studio.setObjectName("btnStudioStart")
                 self.btn_studio.setEnabled(self.vfio_mode)
                 self.btn_studio.setToolTip(studio_idle_tip)
 
-            for button in (self.btn_launch, self.btn_studio):
+            for button in (self.btn_launch, self.btn_detached, self.btn_studio):
                 button.setStyle(button.style())
 
             if hasattr(self, "lbl_engine_badge"):
                 if self._launch_mode == "studio":
                     self.lbl_engine_badge.setText("Studio / Headless")
+                elif self._launch_mode == "detached":
+                    self.lbl_engine_badge.setText("Detached Window")
                 elif self._launch_mode == "gaming":
-                    self.lbl_engine_badge.setText("Gaming Mode")
+                    self.lbl_engine_badge.setText("Playing (UI Feed)")
                 elif self.vfio_mode:
                     self.lbl_engine_badge.setText("Userspace VFIO")
                 else:
@@ -3955,22 +4479,38 @@ if HAS_QT:
                                      int(color[3:5], 16),
                                      int(color[5:7], 16))
 
+        def toggle_fullscreen(self):
+            if not hasattr(self, "_fullscreen_window") or self._fullscreen_window is None:
+                self._fullscreen_window = FullscreenVideoWindow(self.video_canvas, self)
+            if self._fullscreen_window.isVisible():
+                self._fullscreen_window.close()
+            else:
+                self._fullscreen_window.showFullScreen()
+
         def toggle_stream(self):
             if self._switch_pending:
                 return
-            if self._launch_mode == "studio":
-                # Studio is capturing: hand the card over to the SDL window.
+            if self._launch_mode in ("studio", "detached"):
                 self._switch_mode("gaming")
             elif self._launch_mode == "gaming" or self.streamer.is_running:
                 self._stop_stream()
             else:
-                self.start_gaming_screen()
+                self.start_gaming_screen(detached=False)
+
+        def start_detached_window(self):
+            if self._switch_pending:
+                return
+            if self._launch_mode == "detached":
+                self._stop_stream()
+            elif self.streamer.is_running:
+                self._switch_mode("detached")
+            else:
+                self.start_gaming_screen(detached=True)
 
         def toggle_studio(self):
             if self._switch_pending:
                 return
-            if self._launch_mode == "gaming":
-                # Gaming window is open: keep capturing without it.
+            if self._launch_mode in ("gaming", "detached"):
                 self._switch_mode("studio")
             elif self._launch_mode == "studio" or self.streamer.is_running:
                 self._stop_stream()
@@ -3978,13 +4518,7 @@ if HAS_QT:
                 self.start_studio()
 
         def _switch_mode(self, target: str):
-            """Restart the streamer in the other mode without a manual stop.
-
-            ``GameStreamer.stop()`` blocks until the child has exited (SIGTERM,
-            LED handoff and DMA teardown), so the VFIO group is free again
-            before the next instance claims it.  The restart is deferred so Qt
-            can repaint the button row in between.
-            """
+            """Restart the streamer in the other mode without a manual stop."""
             if self._launch_mode == target or self._switch_pending:
                 return
             if target == "studio" and not self.vfio_mode:
@@ -3994,7 +4528,7 @@ if HAS_QT:
             # VFIO stays bound and the DMA ring / OBS feed never stop.
             if (self._ipc is not None and self._ipc.connected and
                     self.streamer.is_running):
-                mode = "gaming" if target == "gaming" else "headless"
+                mode = "gaming" if target in ("gaming", "detached") else "headless"
                 if self._ipc.set_mode(mode):
                     self.streamer.headless = target == "studio"
                     self._set_launch_running(True, target)
@@ -4007,7 +4541,7 @@ if HAS_QT:
                             "uninterrupted", seconds=6.0)
                     else:
                         self._set_vfio_notice(
-                            "Gaming Screen Opened",
+                            "Gaming Mode Active",
                             "Output switched live - capture kept running",
                             seconds=6.0)
                     print(f"[*] Live mode switch to {target} (no restart)")
@@ -4022,21 +4556,27 @@ if HAS_QT:
             if hasattr(self, "lbl_engine_badge"):
                 self.lbl_engine_badge.setText("Switching Mode…")
 
-            # Freeze the row during the handover so the transient idle labels
-            # cannot be clicked twice.
             self.btn_launch.setEnabled(False)
             self.btn_studio.setEnabled(False)
+            if hasattr(self, "btn_detached"):
+                self.btn_detached.setEnabled(False)
+
             if target == "studio":
                 self.btn_studio.setText("Switching to Studio…")
                 self._set_vfio_notice(
                     "Switching to Studio",
-                    "Closing the gaming window; the OBS feed keeps running",
+                    "Closing display presentation; OBS feed keeps running",
+                    seconds=5.0)
+            elif target == "detached":
+                self._set_vfio_notice(
+                    "Opening Detached Window",
+                    "Launching external SDL2 floating presentation",
                     seconds=5.0)
             else:
-                self.btn_launch.setText("Switching to Gaming…")
+                self.btn_launch.setText("Switching to UI Feed…")
                 self._set_vfio_notice(
-                    "Switching to Gaming Screen",
-                    "Opening the interactive SDL2 window",
+                    "Switching to UI Feed",
+                    "Displaying video directly inside Console Hub",
                     seconds=5.0)
             QTimer.singleShot(250, lambda: self._handoff_launch(target))
 
@@ -4046,7 +4586,6 @@ if HAS_QT:
                 return  # superseded by an explicit stop/start
 
             if _vfio_streamer_running() and self._handoff_tries < 8:
-                # The previous instance is still tearing down; retry shortly.
                 self._handoff_tries += 1
                 QTimer.singleShot(150, lambda: self._handoff_launch(target))
                 return
@@ -4055,8 +4594,6 @@ if HAS_QT:
             self._switch_pending = None
             self._handoff_tries = 0
 
-            # Restore an enabled, idle button row: start_* re-labels it on
-            # success and leaves it usable if its preflight refuses.
             self._set_launch_running(False)
 
             if timed_out:
@@ -4069,17 +4606,23 @@ if HAS_QT:
 
             if target == "studio":
                 self.start_studio()
+            elif target == "detached":
+                self.start_gaming_screen(detached=True)
             else:
-                self.start_gaming_screen()
+                self.start_gaming_screen(detached=False)
 
         def _stop_stream(self):
-            # Cancel any in-flight mode handover so its timer cannot relaunch.
             self._switch_pending = None
             self._handoff_tries = 0
+            if hasattr(self, "_fullscreen_window") and self._fullscreen_window and self._fullscreen_window.isVisible():
+                self._fullscreen_window.close()
             if self._ipc is not None:
                 self._ipc.close()
             self.streamer.stop()
             self._set_launch_running(False)
+            if hasattr(self, "video_canvas"):
+                self.video_canvas._last_seq = 0
+                self.video_canvas.update()
             if self.vfio_mode:
                 QTimer.singleShot(900, self._restore_led_after_stream)
 
@@ -4088,7 +4631,7 @@ if HAS_QT:
             self.lbl_hero_meta.setText(detail)
             self._vfio_notice_until = time.time() + seconds
 
-        def start_gaming_screen(self):
+        def start_gaming_screen(self, detached: bool = False):
             if self.streamer.is_running:
                 return
 
@@ -4142,11 +4685,11 @@ if HAS_QT:
                 })
                 self.streamer.aspect = aspect
                 success = self.streamer.start(
-                    fullscreen=want_fullscreen,
+                    fullscreen=want_fullscreen if detached else False,
                     vsync=want_vsync,
                     streamer_mode=want_streamer,
                     v4l2_device=v4l2_device,
-                    headless=False,
+                    headless=not detached,
                     aspect=aspect,
                     osd=want_osd,
                     osd_pos=osd_pos,
@@ -4160,11 +4703,14 @@ if HAS_QT:
                     fg_perf_mode=fg_cfg["fg_perf_mode"],
                     fg_low_latency=fg_cfg["fg_low_latency"])
                 if success:
-                    self._set_launch_running(True, "gaming")
+                    mode_name = "detached" if detached else "gaming"
+                    self._set_launch_running(True, mode_name)
                     self._vfio_notice_until = 0.0
                     self._vfio_volume_applies = 0
                     self._retry_audio_props()
                     self._check_audio_sink()
+                    if not detached and want_fullscreen:
+                        QTimer.singleShot(250, self.toggle_fullscreen)
                     QTimer.singleShot(350, self._ipc_try_attach)
                 else:
                     self._set_vfio_notice(
@@ -4306,6 +4852,8 @@ if HAS_QT:
                 return
             port = 1 if self.combo_duo_input.itemData(index) == 1 else 0
             self.streamer.set_duo_input(port)
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_port(port)
             label = "HDMI 1" if port == 0 else "HDMI 2"
             if self.streamer.is_running:
                 self._set_vfio_notice(
@@ -4323,6 +4871,8 @@ if HAS_QT:
             self.saved_cfg["aspect_ratio"] = aspect
             self.streamer.aspect = aspect
             save_settings({"aspect_ratio": aspect})
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_aspect(aspect)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_aspect(aspect)
             elif self.duo_mode and self.streamer.is_running:
@@ -4337,6 +4887,8 @@ if HAS_QT:
             self.saved_cfg["scale_mode"] = mode
             self.streamer.scale_mode = mode
             save_settings({"scale_mode": mode})
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_scale_mode(mode)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_scale(mode)
             elif self.duo_mode and self.streamer.is_running:

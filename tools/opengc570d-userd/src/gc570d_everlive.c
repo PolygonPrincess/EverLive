@@ -982,6 +982,27 @@ static void *everlive_thread(void *arg)
 		if (!sdl_ready)
 			fprintf(stderr,
 				"[gc570d WARN] EverLive SDL window unavailable; continuing without a preview\n");
+	} else if (st->opt.enable_sdl || st->opt.headless) {
+		/* Open low-latency desktop audio playback even in headless/UI-player mode */
+		SDL_SetHint(SDL_HINT_APP_NAME, "EverLive");
+		SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "EverLive");
+		SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_NAME, "HDMI Game Audio");
+		SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_ROLE, "game");
+		if (SDL_Init(SDL_INIT_AUDIO) == 0) {
+			SDL_AudioSpec want, have;
+			memset(&want, 0, sizeof(want));
+			want.freq = 48000;
+			want.format = AUDIO_S16LSB;
+			want.channels = 2;
+			want.samples = 1024;
+			sdl.audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+			if (sdl.audio_dev > 0) {
+				SDL_PauseAudioDevice(sdl.audio_dev, 0);
+				atomic_store_explicit(&st->audio_dev,
+						      (unsigned int)sdl.audio_dev,
+						      __ATOMIC_RELEASE);
+			}
+		}
 	}
 #endif
 
@@ -1070,7 +1091,7 @@ static void *everlive_thread(void *arg)
 	for (i = 0; i < 2; i++)
 		everlive_v4l2_close(&st->v4l2[i]);
 #ifdef HAVE_SDL2
-	if (sdl_ready)
+	if (sdl_ready || sdl.audio_dev > 0)
 		sdl_destroy(st, &sdl);
 #endif
 	atomic_store_explicit(&st->running, false, __ATOMIC_RELEASE);
