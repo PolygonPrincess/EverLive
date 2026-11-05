@@ -49,6 +49,9 @@ else
 fi
 
 # 1. Ensure userspace engine binaries are built and up to date
+if ! make -C "${SCRIPT_DIR}/tools/libeverlive-core" -q >/dev/null 2>&1; then
+    make -C "${SCRIPT_DIR}/tools/libeverlive-core" -j"$(nproc)"
+fi
 if ! make -C "${USERD_DIR}" -q >/dev/null 2>&1; then
     echo "[*] Aktualisiere/Kompiliere EverLive Userspace VFIO Engine..."
     make -C "${USERD_DIR}" -j"$(nproc)"

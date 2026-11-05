@@ -5227,9 +5227,17 @@ def main():
             if not (_proc_running("everlive_userd") and mode == 4):
                 set_vfio_led(mode)
     else:
-        QGuiApplication.setDesktopFileName("everlive")
         app = QApplication(sys.argv)
         app.setApplicationName("EverLive")
+
+        # Only register desktop file with host portal if a matching .desktop file is installed
+        for candidate in ("everlive-experimental", "everlive"):
+            user_path = os.path.expanduser(f"~/.local/share/applications/{candidate}.desktop")
+            sys_path = f"/usr/share/applications/{candidate}.desktop"
+            if os.path.isfile(user_path) or os.path.isfile(sys_path):
+                app.setDesktopFileName(candidate)
+                break
+
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "everlive.png")
         if os.path.isfile(icon_path):
             app.setWindowIcon(QIcon(icon_path))
@@ -5237,7 +5245,18 @@ def main():
                             headless_start=args.headless, v4l2_device=args.v4l2)
         if not args.tray:
             window.show()
-        sys.exit(app.exec())
+        ret = app.exec()
+
+        # Clean teardown for PySide6 on Python 3.14 to prevent double-free SEGV in Shiboken atexit
+        try:
+            if hasattr(window, "tray_icon") and window.tray_icon:
+                window.tray_icon.hide()
+                window.tray_icon.deleteLater()
+            window.deleteLater()
+            app.processEvents()
+        except Exception:
+            pass
+        os._exit(ret)
 
 
 if __name__ == "__main__":
