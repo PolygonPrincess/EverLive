@@ -277,19 +277,25 @@ ensure_lsfg_vk() {
         # 3. Universeller Fallback (Ubuntu/Debian/Fedora/Arch ohne AUR-Helper):
         #    Offizielles lsfg-vk 2.0 Release-Archiv von builds.lsfg-vk.dev nach ~/.local
         if ! has_lsfg_vk_layer && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
-            local archive_rel=""
-            local archive_url=""
+            local archive_ver="2.0.0"
+            local archive_sha256="08bdbdf373a111022df87dac7aa87e3b564bb841f961552e3ca85fea12b5aa74"
+            local archive_rel="lsfg-vk-${archive_ver}.tar.xz"
+            local archive_url="https://builds.lsfg-vk.dev/${archive_rel}"
             local tmp_tar=""
 
-            archive_rel="$(curl -fsSL --max-time 10 https://builds.lsfg-vk.dev/ 2>/dev/null | \
-                sed -n 's/.*href="\([^"]*\.tar\.xz\)">&gt;&gt; Latest release.*/\1/p' | head -n 1 || true)"
-            [ -z "${archive_rel}" ] && archive_rel="lsfg-vk-2.0.0.tar.xz"
-            archive_url="https://builds.lsfg-vk.dev/${archive_rel}"
-
-            echo -e "[*] Lade offizielles lsfg-vk 2.0 Paket (${archive_rel})..."
+            echo -e "[*] Lade offizielles lsfg-vk ${archive_ver} Paket (${archive_rel})..."
             tmp_tar="$(mktemp /tmp/everlive-lsfg-vk.XXXXXX.tar.xz)"
             if curl -fL --max-time 60 "${archive_url}" -o "${tmp_tar}" &&
                tar -tJf "${tmp_tar}" >/dev/null 2>&1; then
+                local tar_hash=""
+                tar_hash="$(sha256sum "${tmp_tar}" 2>/dev/null | awk '{print $1}')"
+                if [ "${tar_hash}" != "${archive_sha256}" ]; then
+                    echo -e "${RED}[ERROR] Checksummen-Verifikation für ${archive_rel} fehlgeschlagen!${NC}"
+                    echo -e "  Erwartet: ${archive_sha256}"
+                    echo -e "  Erhalten: ${tar_hash}"
+                    rm -f "${tmp_tar}"
+                    return 0
+                fi
                 chmod 644 "${tmp_tar}"
                 if [ "${TARGET_USER}" != "root" ]; then
                     sudo -u "${TARGET_USER}" mkdir -p "${TARGET_HOME}/.local"
@@ -401,7 +407,7 @@ echo -e "${BLUE}[*] Kompiliere GC570D (Live Gamer DUO) Userspace Engine...${NC}"
 make -C "${GC570D_DIR}" clean >/dev/null 2>&1 || true
 make -C "${GC570D_DIR}" -j"$(nproc)"
 # Never leave build artifacts world-writable, and keep the binary setcap-safe.
-chmod 0755 "${USERD_DIR}/gc573_user_streamer" "${USERD_DIR}/everlive_userd" "${USERD_DIR}/gc573_user_probe" \
+chmod 0755 "${USERD_DIR}/gc573_user_streamer" "${USERD_DIR}/everlive_userd" "${USERD_DIR}/gc573_user_probe" "${USERD_DIR}/gc573_user_diag" \
     "${GC570D_DIR}/opengc570d-userd" "${GC570D_DIR}/gc570d-ctl" "${SCRIPT_DIR}/play.sh"
 chmod 0644 "${GC570D_DIR}/libgc570d-v4l2.so" 2>/dev/null || true
 # Install the GC570D helpers (udev rule, memlock, systemd unit, sleep hook)

@@ -109,16 +109,25 @@ ensure_user_lsfg_vk() {
         return 0
     fi
 
-    local archive_rel=""
+    local archive_ver="2.0.0"
+    local archive_sha256="08bdbdf373a111022df87dac7aa87e3b564bb841f961552e3ca85fea12b5aa74"
+    local archive_rel="lsfg-vk-${archive_ver}.tar.xz"
+    local archive_url="https://builds.lsfg-vk.dev/${archive_rel}"
     local tmp_tar=""
-    archive_rel="$(curl -fsSL --max-time 10 https://builds.lsfg-vk.dev/ 2>/dev/null | \
-        sed -n 's/.*href="\([^"]*\.tar\.xz\)">&gt;&gt; Latest release.*/\1/p' | head -n 1 || true)"
-    [ -z "${archive_rel}" ] && archive_rel="lsfg-vk-2.0.0.tar.xz"
 
     echo -e "[*] Downloading official ${archive_rel} into ${TARGET_HOME}/.local..."
     tmp_tar="$(mktemp /tmp/everlive-lsfg-vk.XXXXXX.tar.xz)"
-    if curl -fL --max-time 60 "https://builds.lsfg-vk.dev/${archive_rel}" -o "${tmp_tar}" &&
+    if curl -fL --max-time 60 "${archive_url}" -o "${tmp_tar}" &&
        tar -tJf "${tmp_tar}" >/dev/null 2>&1; then
+        local tar_hash=""
+        tar_hash="$(sha256sum "${tmp_tar}" 2>/dev/null | awk '{print $1}')"
+        if [ "${tar_hash}" != "${archive_sha256}" ]; then
+            echo -e "${RED}[ERROR] Checksum verification failed for ${archive_rel}!${NC}"
+            echo -e "  Expected: ${archive_sha256}"
+            echo -e "  Got     : ${tar_hash}"
+            rm -f "${tmp_tar}"
+            return 0
+        fi
         chmod 644 "${tmp_tar}"
         if [ "${EUID}" -eq 0 ] && [ "${TARGET_USER}" != "root" ]; then
             sudo -u "${TARGET_USER}" mkdir -p "${TARGET_HOME}/.local"
@@ -146,6 +155,7 @@ fi
 #    generation on top, so both can use the hardware (never at the same time).
 echo -e "\n${BLUE}[1/3] Building the userspace VFIO engine...${NC}"
 make -C "${USERD_DIR}" -j"$(nproc)"
+chmod 0755 "${USERD_DIR}/gc573_user_streamer" "${USERD_DIR}/everlive_userd" "${USERD_DIR}/gc573_user_probe" "${USERD_DIR}/gc573_user_diag" 2>/dev/null || true
 if [ -d "${GC570D_DIR}" ]; then
     echo -e "${BLUE}[*] Building the GC570D userspace engine...${NC}"
     make -C "${GC570D_DIR}" -j"$(nproc)"

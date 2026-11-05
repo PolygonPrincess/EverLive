@@ -43,6 +43,16 @@ jobs:
           make -C tools/opengc573-userd CC=clang -j"$(nproc)"
           make -C tools/opengc570d-userd CC=clang -j"$(nproc)"
 
+      - name: Compile Legacy Direct-Renderer (everlive_display)
+        run: |
+          gcc -O3 -Wall -Wextra -o tools/everlive/everlive_display tools/everlive/everlive_display.c $(pkg-config --cflags --libs sdl2) -lGL -lm -lX11 -lpthread
+
+      - name: Run Full Unit Test Suite (with AddressSanitizer)
+        run: |
+          make -C tests clean
+          make -C tests asan
+          ./tests/run_tests.sh
+
       - name: Frame generation cadence self-test
         run: |
           make -C tools/opengc573-userd selftest

@@ -779,7 +779,7 @@ int gc573_user_edid_compare(const u8 *edid, size_t size,
 int gc573_user_verify_edid(void *bar0, unsigned int *mismatches,
 			   unsigned int *first_offset)
 {
-	u8 edid[GC573_EDID_SIZE];
+	u8 edid[GC573_EDID_SIZE] = { 0 };
 	int ret;
 
 	ret = gc573_user_read_edid(bar0, edid);

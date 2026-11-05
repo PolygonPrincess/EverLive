@@ -42,6 +42,9 @@ tools/opengc570d-userd/libgc570d-v4l2.so
 # Test binaries
 tests/test_edid
 tests/test_config
+tests/test_framegen
+tests/test_ipc_json
+tests/test_edid_unifier
 tools/opengc573-userd/gc573_framegen_selftest
 
 # Raw uncompressed video dumps

@@ -680,12 +680,12 @@ LED_COLORS = {
     1: "#3b82f6",  # Blau (Standard)
     2: "#10b981",  # Grün
     3: "#ef4444",  # Rot
-    4: "#06b6d4",  # Cyan / Türkis
+    4: "#00ccff",  # Cyan / Türkis
     5: "#d946ef",  # Magenta / Lila
     6: "#eab308",  # Gelb
     7: "#f8fafc",  # Weiß
     8: "#a855f7",  # Rainbow Wave (Multi-Zone)
-    9: "#06b6d4",  # Spectrum Cycle
+    9: "#00ccff",  # Spectrum Cycle
 }
 
 # RGB values understood by everlive_userd --color.  Cyan matches the verified
@@ -739,7 +739,7 @@ def set_gc570d_led(mode: int) -> bool:
     return True
 
 
-def set_vfio_led(mode: int) -> bool:
+def set_vfio_led(mode: int, async_apply: bool = False) -> bool:
     """Apply an LED colour through everlive_userd (VFIO mode).
 
     everlive_userd owns BAR0 in standby.  A colour change therefore restarts
@@ -747,6 +747,11 @@ def set_vfio_led(mode: int) -> bool:
     BAR0 and drives the LED itself; in that case the choice is only persisted
     and restored after the streamer exits.
     """
+    if async_apply:
+        import threading
+        threading.Thread(target=set_vfio_led, args=(mode, False), daemon=True).start()
+        return True
+
     mode = int(mode)
     resolved = userd_bin("everlive_userd")
     if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
@@ -931,7 +936,7 @@ def _wpctl_everlive_stream_ids() -> list:
     ids = []
     try:
         out = subprocess.check_output(["wpctl", "status"], text=True,
-                                      stderr=subprocess.DEVNULL)
+                                      stderr=subprocess.DEVNULL, timeout=0.5)
     except Exception:
         return ids
 
@@ -956,7 +961,8 @@ def _pactl_everlive_sink_ids() -> list:
     ids = []
     try:
         out = subprocess.check_output(["pactl", "list", "sink-inputs"],
-                                      text=True, stderr=subprocess.DEVNULL)
+                                      text=True, stderr=subprocess.DEVNULL,
+                                      timeout=0.5)
     except Exception:
         return ids
 
@@ -3818,7 +3824,7 @@ if HAS_QT:
                         return self.streamer.apply_duo_led(mode)
                     print("[*] LED mode saved; it is applied when the DUO engine starts.")
                     return True
-                ok = set_vfio_led(mode)
+                ok = set_vfio_led(mode, async_apply=True)
                 if self.streamer.is_running:
                     print("[*] LED colour saved; the active userspace stream keeps cyan until it exits.")
                 return ok

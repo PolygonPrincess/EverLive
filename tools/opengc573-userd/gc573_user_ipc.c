@@ -112,10 +112,7 @@ bool gc573_ipc_poll_cmd(struct gc573_ipc_cmd *out)
 
 static uint64_t ipc_now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000U + (uint64_t)(ts.tv_nsec / 1000000L);
+	return gc573_now_ms();
 }
 
 static const char *skip_ws(const char *p)
@@ -348,13 +345,52 @@ static void ipc_send_raw(struct ipc_client *c, const char *data, size_t len)
 	}
 }
 
+static void json_format_id(char *dst, size_t dstsz, const char *id)
+{
+	if (!dst || dstsz == 0)
+		return;
+	if (!id || !*id || strcmp(id, "null") == 0) {
+		snprintf(dst, dstsz, "null");
+		return;
+	}
+	char *end = NULL;
+	strtol(id, &end, 10);
+	if (end && *end == '\0') {
+		snprintf(dst, dstsz, "%s", id);
+		return;
+	}
+	size_t len = strlen(id);
+	char inner[IPC_ID_MAX];
+	const char *to_esc = id;
+	if (id[0] == '"' && len >= 2 && id[len - 1] == '"') {
+		size_t in_len = len - 2;
+		if (in_len >= sizeof(inner))
+			in_len = sizeof(inner) - 1;
+		memcpy(inner, id + 1, in_len);
+		inner[in_len] = '\0';
+		to_esc = inner;
+	}
+	if (dstsz >= 3) {
+		dst[0] = '"';
+		json_escape_into(dst + 1, dstsz - 2, to_esc);
+		size_t elen = strlen(dst);
+		dst[elen] = '"';
+		dst[elen + 1] = '\0';
+	} else {
+		snprintf(dst, dstsz, "null");
+	}
+}
+
 static void ipc_reply(struct ipc_client *c, const char *id,
 		      const char *result_json)
 {
+	char esc_id[IPC_ID_MAX * 2];
 	char buf[IPC_REPLY_MAX];
+
+	json_format_id(esc_id, sizeof(esc_id), id);
 	int n = snprintf(buf, sizeof(buf),
 			 "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":%s}\n",
-			 id ? id : "null", result_json);
+			 esc_id, result_json);
 
 	if (n > 0 && (size_t)n < sizeof(buf))
 		ipc_send_raw(c, buf, (size_t)n);
@@ -363,11 +399,16 @@ static void ipc_reply(struct ipc_client *c, const char *id,
 static void ipc_error(struct ipc_client *c, const char *id, int code,
 		      const char *message)
 {
-	char buf[256];
+	char esc_id[IPC_ID_MAX * 2];
+	char esc_msg[256];
+	char buf[512];
+
+	json_format_id(esc_id, sizeof(esc_id), id);
+	json_escape_into(esc_msg, sizeof(esc_msg), message ? message : "error");
 	int n = snprintf(buf, sizeof(buf),
 			 "{\"jsonrpc\":\"2.0\",\"id\":%s,"
 			 "\"error\":{\"code\":%d,\"message\":\"%s\"}}\n",
-			 id ? id : "null", code, message);
+			 esc_id, code, esc_msg);
 
 	if (n > 0 && (size_t)n < sizeof(buf))
 		ipc_send_raw(c, buf, (size_t)n);

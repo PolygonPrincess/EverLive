@@ -18,7 +18,9 @@ TARGET_HOME="$(getent passwd "${TARGET_USER}" | cut -d: -f6)"
 
 echo "[*] Deinstalliere EverLive..."
 
-# 1. Laufende Daemons beenden
+# 1. Laufende Daemons sauber beenden (zuerst SIGTERM, dann SIGKILL)
+killall -TERM everlive_userd gc573_user_streamer opengc570d-userd gc570d-ctl 2>/dev/null || true
+sleep 0.5
 killall -9 everlive_userd gc573_user_streamer opengc570d-userd gc570d-ctl 2>/dev/null || true
 rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gc570d/control.sock" 2>/dev/null || true
 rm -f /dev/shm/gc570d_v4l2_shm 2>/dev/null || true

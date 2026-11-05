@@ -26,15 +26,19 @@ all: $(TARGETS)
 
 gc573_user_probe: gc573_user_probe.o $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@chmod 0755 $@
 
 gc573_user_streamer: gc573_user_streamer.o $(COMMON_OBJS) $(STREAM_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(SDL_LIBS) $(AV_LIBS) $(PW_LIBS) -lm
+	@chmod 0755 $@
 
 everlive_userd: everlive_userd.o $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@chmod 0755 $@
 
 gc573_user_diag: gc573_user_diag.o $(COMMON_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@chmod 0755 $@
 
 # Headless smoke test for the console cadence detector: a synthetic
 # "30 FPS duplicated inside a 60 Hz HDMI container" stream must be recognised

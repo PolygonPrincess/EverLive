@@ -30,6 +30,7 @@
 #include "gc573_user_hdr.h"
 #include "gc573_user_framegen.h"
 #include "gc573_user_font8x8.h"
+#include "gc573_user_led.h"
 #include <SDL2/SDL.h>
 #include <libswscale/swscale.h>
 #include <ctype.h>
@@ -40,11 +41,13 @@
 #include <math.h>
 #include <linux/videodev2.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -638,13 +641,31 @@ static bool start_led_daemon(struct gc573_vfio_ctx *ctx, bool handoff)
 	snprintf(led_g, sizeof(led_g), "%u", g_led_g);
 	snprintf(led_b, sizeof(led_b), "%u", g_led_b);
 
+	int err_pipe[2];
+	if (pipe2(err_pipe, O_CLOEXEC) < 0) {
+		err_pipe[0] = -1;
+		err_pipe[1] = -1;
+	}
+
 	pid = fork();
-	if (pid < 0)
+	if (pid < 0) {
+		if (err_pipe[0] >= 0) {
+			close(err_pipe[0]);
+			close(err_pipe[1]);
+		}
 		return false;
+	}
 	if (pid == 0) {
+		if (err_pipe[0] >= 0)
+			close(err_pipe[0]);
 		setsid();
 		mark_extra_fds_close_on_exec(ctx->container_fd, ctx->group_fd,
 					     ctx->device_fd);
+		if (err_pipe[1] >= 0) {
+			int flags = fcntl(err_pipe[1], F_GETFD);
+			if (flags >= 0)
+				fcntl(err_pipe[1], F_SETFD, flags | FD_CLOEXEC);
+		}
 		if (g_led_mode == STREAM_LED_WAVE) {
 			execl(exe, "everlive_userd", "--inherit",
 			      container_fd, group_fd, device_fd,
@@ -659,7 +680,28 @@ static bool start_led_daemon(struct gc573_vfio_ctx *ctx, bool handoff)
 			      bar_offset, bar_size, "--color",
 			      led_r, led_g, led_b, (char *)NULL);
 		}
+		int err = errno;
+		if (err_pipe[1] >= 0) {
+			ssize_t written = write(err_pipe[1], &err, sizeof(err));
+			(void)written;
+			close(err_pipe[1]);
+		}
 		_exit(127);
+	}
+
+	if (err_pipe[1] >= 0)
+		close(err_pipe[1]);
+
+	if (err_pipe[0] >= 0) {
+		int exec_err = 0;
+		ssize_t n = read(err_pipe[0], &exec_err, sizeof(exec_err));
+		close(err_pipe[0]);
+		if (n > 0) {
+			pr_err("Failed to exec standby daemon %s: %s (errno %d)",
+			       exe, strerror(exec_err), exec_err);
+			waitpid(pid, NULL, 0);
+			return false;
+		}
 	}
 
 	if (handoff) {
@@ -675,68 +717,12 @@ static bool start_led_daemon(struct gc573_vfio_ctx *ctx, bool handoff)
 
 static uint64_t now_us(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+	return gc573_now_us();
 }
 
 static uint64_t now_ms(void)
 {
-	return now_us() / 1000;
-}
-
-#define RAINBOW_SATURATION	150U
-#define RAINBOW_VALUE_MIN	150U
-#define RAINBOW_VALUE_MAX	205U
-
-static void hsv_to_rgb(uint32_t hue, uint8_t sat, uint8_t val,
-		       uint8_t *r, uint8_t *g, uint8_t *b)
-{
-	uint32_t region = (hue >> 8) % 6U;
-	uint32_t rem = hue & 0xffU;
-	uint8_t p = (uint8_t)((val * (255U - sat)) / 255U);
-	uint8_t q = (uint8_t)((val * (255U - (sat * rem) / 255U)) / 255U);
-	uint8_t t = (uint8_t)((val *
-			      (255U - (sat * (255U - rem)) / 255U)) / 255U);
-
-	switch (region) {
-	case 0: *r = val; *g = t;   *b = p;   break;
-	case 1: *r = q;   *g = val; *b = p;   break;
-	case 2: *r = p;   *g = val; *b = t;   break;
-	case 3: *r = p;   *g = q;   *b = val; break;
-	case 4: *r = t;   *g = p;   *b = val; break;
-	default:*r = val; *g = p;   *b = q;   break;
-	}
-}
-
-static void rainbow_tick(uint64_t elapsed_ms, uint32_t cycle_ms,
-			 uint8_t *r, uint8_t *g, uint8_t *b)
-{
-	uint32_t pos = cycle_ms ? (uint32_t)(elapsed_ms % cycle_ms) : 0U;
-	uint32_t hue = (uint32_t)(((uint64_t)pos * 1536U) / cycle_ms);
-	uint32_t half = cycle_ms / 2U;
-	uint32_t level, breath, val;
-
-	if (!half)
-		half = 1U;
-
-	level = (uint32_t)(((uint64_t)(pos % half) * 255U) / half);
-	breath = (level <= 127U) ? level * 2U : (255U - level) * 2U;
-	val = RAINBOW_VALUE_MIN +
-	      ((RAINBOW_VALUE_MAX - RAINBOW_VALUE_MIN) * breath) / 255U;
-
-	hsv_to_rgb(hue, RAINBOW_SATURATION, (uint8_t)val, r, g, b);
-}
-
-static void wave_tick(uint64_t elapsed_ms, uint32_t cycle_ms, uint32_t colors[5])
-{
-	for (int i = 0; i < 5; i++) {
-		uint64_t zone_elapsed = elapsed_ms + ((uint64_t)i * cycle_ms) / 5U;
-		uint8_t r, g, b;
-		rainbow_tick(zone_elapsed, cycle_ms, &r, &g, &b);
-		colors[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-	}
+	return gc573_now_ms();
 }
 
 static pthread_t g_led_thread;
@@ -1775,9 +1761,9 @@ struct frame_preview {
 	pthread_t thread;
 	pthread_mutex_t lock;
 	bool lock_ready;
-	bool started;
-	bool stop;
-	bool stalled;
+	_Atomic bool started;
+	_Atomic bool stop;
+	_Atomic bool stalled;
 	struct gc573_user_video *video;
 	uint8_t *buffers[PREVIEW_MAX_BUFFERS];
 	bool busy[PREVIEW_MAX_BUFFERS];
@@ -1807,8 +1793,8 @@ static void *preview_thread(void *arg)
 		int slot = -1;
 
 		if (index == -2) {
-			__atomic_store_n(&preview->stalled, true,
-					 __ATOMIC_RELAXED);
+			atomic_store_explicit(&preview->stalled, true,
+					      memory_order_relaxed);
 			break;
 		}
 		if (index < 0)
@@ -4898,7 +4884,7 @@ static void publish_ipc_stats(bool have_signal, bool streaming,
 			      uint32_t out_w, uint32_t out_h,
 			      double fps, uint64_t frames,
 			      const struct gc573_user_video *video,
-			      const struct audio_stream *audio,
+			      struct audio_stream *audio,
 			      const struct v4l2_sink *sink)
 {
 	struct gc573_stats st;
@@ -4920,6 +4906,9 @@ static void publish_ipc_stats(bool have_signal, bool streaming,
 	st.frames = frames;
 	st.ring_buffers = video->num_buffers;
 	st.ring_channels = video->num_channels;
+
+	if (audio->lock_ready)
+		pthread_mutex_lock(&audio->lock);
 
 	if (audio->streaming) {
 		if (audio->bt_playing) {
@@ -4949,6 +4938,9 @@ static void publish_ipc_stats(bool have_signal, bool streaming,
 		snprintf(st.audio_label, sizeof(st.audio_label),
 			 "No HDMI audio");
 	}
+
+	if (audio->lock_ready)
+		pthread_mutex_unlock(&audio->lock);
 
 	st.audio_gain = float_from_bits(
 		__atomic_load_n(&g_audio_gain_bits, __ATOMIC_RELAXED));
@@ -6274,7 +6266,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (streaming && __atomic_load_n(&g_preview.stalled, __ATOMIC_RELAXED)) {
+		if (streaming && atomic_load_explicit(&g_preview.stalled, memory_order_relaxed)) {
 			u8 *b = (u8 *)ctx.bar0;
 
 			pr_err("Video DMA stalled; stopping capture. Diagnostic dump:\n"
