@@ -2172,6 +2172,32 @@ if HAS_QT:
     SHM_FRAME_BYTES = 1920 * 1080 * 2
     SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_FRAME_BYTES
 
+    class _Py_buffer(ctypes.Structure):
+        _fields_ = [
+            ("buf", ctypes.c_void_p),
+            ("obj", ctypes.c_void_p),
+            ("len", ctypes.c_ssize_t),
+            ("itemsize", ctypes.c_ssize_t),
+            ("readonly", ctypes.c_int),
+            ("ndim", ctypes.c_int),
+            ("format", ctypes.c_char_p),
+            ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("internal", ctypes.c_void_p),
+        ]
+
+    def _get_buffer_addr(buf) -> int:
+        try:
+            pybuf = _Py_buffer()
+            if ctypes.pythonapi.PyObject_GetBuffer(ctypes.py_object(buf), ctypes.byref(pybuf), 0) == 0:
+                addr = pybuf.buf
+                ctypes.pythonapi.PyBuffer_Release(ctypes.byref(pybuf))
+                return addr or 0
+        except Exception:
+            pass
+        return 0
+
     _lib_core = None
     try:
         _core_path = os.path.join(
@@ -2179,9 +2205,9 @@ if HAS_QT:
         if os.path.isfile(_core_path):
             _lib_core = ctypes.CDLL(_core_path)
             _lib_core.everlive_yuy2_to_rgb.argtypes = [
-                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             _lib_core.everlive_yuy2_to_rgb_scaled.argtypes = [
-                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     except Exception:
         _lib_core = None
 
@@ -2331,10 +2357,11 @@ if HAS_QT:
                 if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_len:
                     self._rgb_buffer = bytearray(rgb_len)
 
-                if _lib_core is not None:
-                    src_ptr = (ctypes.c_char * payload_len).from_buffer(yuy2_slice)
-                    dst_ptr = (ctypes.c_char * rgb_len).from_buffer(self._rgb_buffer)
-                    _lib_core.everlive_yuy2_to_rgb(src_ptr, dst_ptr, width, height)
+                yuy2_addr = _get_buffer_addr(yuy2_slice)
+                dst_addr = _get_buffer_addr(self._rgb_buffer)
+
+                if _lib_core is not None and yuy2_addr and dst_addr:
+                    _lib_core.everlive_yuy2_to_rgb(yuy2_addr, dst_addr, width, height)
                     qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
                 elif HAS_NUMPY:
                     raw = np.frombuffer(yuy2_slice, dtype=np.uint8).reshape((height, width, 2))
@@ -2346,13 +2373,24 @@ if HAS_QT:
                     b = np.clip(y + ((454 * u) >> 8), 0, 255).astype(np.uint8)
                     rgb_arr = np.ascontiguousarray(np.dstack((r, g, b)))
                     qimg = QImage(rgb_arr.data, width, height, width * 3, QImage.Format_RGB888).copy()
+                elif _lib_core is not None and dst_addr:
+                    src_copy = bytearray(yuy2_slice)
+                    src_addr = _get_buffer_addr(src_copy)
+                    if src_addr:
+                        _lib_core.everlive_yuy2_to_rgb(src_addr, dst_addr, width, height)
+                        qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
+                    else:
+                        return
                 else:
                     return
 
                 self._last_seq = seq
                 self._current_qimage = qimg
                 self.update()
-            except Exception:
+            except Exception as e:
+                if not getattr(self, "_logged_poll_err", False):
+                    print(f"[EmbeddedVideoCanvas] poll_frame error: {e}")
+                    self._logged_poll_err = True
                 if self._shm_mmap:
                     try: self._shm_mmap.close()
                     except Exception: pass
