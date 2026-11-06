@@ -308,15 +308,26 @@ if QSocketNotifier is not None:
                 params["device"] = str(device)
             return self.request("v4l2.set", params)
 
-        def set_hdr(self, enabled: bool, exposure_ev: float = 0.0) -> bool:
+        def set_hdr(self, enabled: bool, exposure_ev: float = 0.0,
+                    passthrough: bool = False) -> bool:
             """Enable/disable HDR10/HLG to SDR tonemapping on a running engine.
 
             ``exposure_ev`` biases the ACES curve, -2.0 .. +2.0 EV.
+            ``passthrough`` preserves native BT.2020 PQ/HLG for HDR displays.
             """
             return self.request("hdr.set", {
-                "mode": "auto" if enabled else "off",
+                "mode": "passthrough" if (enabled and passthrough) else ("auto" if enabled else "off"),
                 "exposure": max(-2.0, min(2.0, float(exposure_ev))),
+                "passthrough": bool(passthrough),
             })
+
+        def set_hdr_passthrough(self, enabled: bool) -> bool:
+            """Toggle native HDR passthrough on an active HDR stream."""
+            return self.request("hdr.passthrough", {"enabled": bool(enabled)})
+
+        def show_toast(self, message: str) -> bool:
+            """Trigger an OSD toast notification on the gaming screen."""
+            return self.request("toast.show", {"message": str(message)})
 
         def set_scale(self, mode: str) -> bool:
             """Scaling mode: ``fit`` (bilinear) or ``integer`` (nearest).

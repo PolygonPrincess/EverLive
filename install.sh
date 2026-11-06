@@ -434,7 +434,9 @@ make -C "${GC570D_DIR}" -j"$(nproc)"
 # Never leave build artifacts world-writable, and keep the binary setcap-safe.
 chmod 0755 "${USERD_DIR}/gc573_user_streamer" "${USERD_DIR}/everlive_userd" "${USERD_DIR}/gc573_user_probe" "${USERD_DIR}/gc573_user_diag" \
     "${GC570D_DIR}/opengc570d-userd" "${GC570D_DIR}/gc570d-ctl" "${SCRIPT_DIR}/play.sh"
-chmod 0644 "${GC570D_DIR}/libgc570d-v4l2.so" 2>/dev/null || true
+chmod 0644 "${GC570D_DIR}/libgc570d-v4l2.so" "${USERD_DIR}/libgc573-v4l2.so" 2>/dev/null || true
+install -m 0644 "${USERD_DIR}/libgc573-v4l2.so" /usr/local/lib/ 2>/dev/null || true
+ln -sf /usr/local/lib/libgc573-v4l2.so /usr/local/lib/libeverlive-v4l2.so 2>/dev/null || true
 # Install the GC570D helpers (udev rule, memlock, systemd unit, sleep hook)
 # through the engine's own Makefile so both installers stay in sync.
 make -C "${GC570D_DIR}" install

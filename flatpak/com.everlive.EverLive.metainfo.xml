@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.everlive.EverLive</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-only</project_license>
+  <name>EverLive</name>
+  <summary>Userspace VFIO HDMI capture, lossless scaling frame generation, and streaming hub</summary>
+  <description>
+    <p>
+      EverLive is a userspace capture and gaming suite designed for AVerMedia Live Gamer 4K (GC573)
+      and Live Gamer DUO (GC570D).
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Kernel-driver-free userspace VFIO streaming engine</li>
+      <li>Zero-copy, low-latency HDMI passthrough and direct display</li>
+      <li>Lossless Scaling 2x Frame Generation (60 to 120 FPS, 30 to 60 FPS)</li>
+      <li>Native HDR10/HLG passthrough and real-time filmic SDR ACES tonemapping</li>
+      <li>Virtual camera integration via shared memory for Discord, OBS, and Chrome</li>
+      <li>Custom EDID and modeline timing generator</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.everlive.EverLive.desktop</launchable>
+  <url type="homepage">https://github.com/PolygonPrincess/EverLive</url>
+  <provides>
+    <binary>everlive</binary>
+  </provides>
+</component>

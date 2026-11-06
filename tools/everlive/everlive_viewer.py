@@ -489,12 +489,14 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSlider, QFrame,
         QGroupBox, QMessageBox, QStackedLayout, QSizePolicy, QFileDialog,
-        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox, QScrollArea
+        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox, QScrollArea,
+        QColorDialog, QDialog, QLineEdit, QTextEdit
     )
     from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize, QRect, QPoint
     from PySide6.QtGui import (
         QGuiApplication, QFont, QIcon, QColor, QPalette, QKeySequence, QShortcut,
-        QDesktopServices, QPixmap, QPainter, QAction, QImage, QPen, QBrush, QCursor
+        QDesktopServices, QPixmap, QPainter, QAction, QImage, QPen, QBrush, QCursor,
+        QFontMetrics
     )
     HAS_QT = True
 except ImportError:
@@ -2166,11 +2168,322 @@ class GameStreamer:
 
 if HAS_QT:
     SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
+    SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
     SHM_MAGIC = 0x47433537  # "GC57"
     SHM_HEADER_SIZE = 40
     SHM_PORT_HEADER_SIZE = 32
     SHM_FRAME_BYTES = 1920 * 1080 * 2
     SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_FRAME_BYTES
+
+    # Base 256-byte CTA-861 EDID for custom modeline synthesis
+    BASE_GC573_EDID = bytes.fromhex(
+        "00ffffffffffff0006d8360000000000"
+        "101c010380a05a78ea08a5a2574fa228"
+        "0f5054250b00d1c08140818081008bc0"
+        "9500b3003b8008e80030f2705a80b058"
+        "8a006d552100001e0cdf80a070384040"
+        "30403500202f2100001e000000fc0041"
+        "56542047433537330a202020000000fd"
+        "0032f01ede3c000a2020202020200111"
+        "020344f15961605f5e5d101f5a3f0514"
+        "0413121103020122212016150706230f"
+        "0707834f000067030c001000383c67d8"
+        "5dc401788003e200cfe305c000e20f03"
+        "e30605016fc200a0a0a0555030203500"
+        "55502100001e9ee80078a0a067500820"
+        "980455502100001e565e00a0a0a02950"
+        "30203500555021000018000000000006"
+    )
+
+    def parse_modeline(line: str) -> dict:
+        """Parse an X11 / xrandr Modeline into its component timings and validate."""
+        text = line.strip()
+        if text.startswith("Modeline"):
+            text = text[8:].strip()
+
+        name = "custom"
+        m_name = re.match(r'^"([^"]+)"\s*(.*)', text)
+        if m_name:
+            name = m_name.group(1).strip()
+            text = m_name.group(2).strip()
+        else:
+            parts = text.split(None, 1)
+            if len(parts) == 2 and not re.match(r'^[0-9.]+$', parts[0]):
+                name = parts[0]
+                text = parts[1]
+
+        tokens = text.split()
+        if len(tokens) < 9:
+            raise ValueError("Modeline must contain at least 9 numeric timing values (Clock, 4 H, 4 V)")
+
+        pclk_mhz = float(tokens[0])
+        h_active = int(tokens[1])
+        h_sync_start = int(tokens[2])
+        h_sync_end = int(tokens[3])
+        h_total = int(tokens[4])
+
+        v_active = int(tokens[5])
+        v_sync_start = int(tokens[6])
+        v_sync_end = int(tokens[7])
+        v_total = int(tokens[8])
+
+        flags = [t.lower() for t in tokens[9:]]
+        interlaced = "interlace" in flags or "interlaced" in flags
+        hsync_pos = "+hsync" in flags or "-hsync" not in flags
+        vsync_pos = "+vsync" in flags or "-vsync" not in flags
+
+        if not (10.0 <= pclk_mhz <= 650.0):
+            raise ValueError(f"Pixel clock {pclk_mhz:.2f} MHz outside supported HDMI range (10 - 650 MHz)")
+        if not (320 <= h_active <= 4096):
+            raise ValueError(f"Horizontal active {h_active} out of range (320 - 4096)")
+        if not (200 <= v_active <= 2160):
+            raise ValueError(f"Vertical active {v_active} out of range (200 - 2160)")
+        if not (h_active < h_sync_start <= h_sync_end < h_total):
+            raise ValueError("Horizontal timings must satisfy: active < sync_start <= sync_end < total")
+        if not (v_active < v_sync_start <= v_sync_end < v_total):
+            raise ValueError("Vertical timings must satisfy: active < sync_start <= sync_end < total")
+
+        h_blank = h_total - h_active
+        v_blank = v_total - v_active
+        if h_blank > 4095 or v_blank > 4095:
+            raise ValueError("Blanking intervals exceed 12-bit EDID field limits")
+
+        h_sync_offset = h_sync_start - h_active
+        h_sync_width = h_sync_end - h_sync_start
+        v_sync_offset = v_sync_start - v_active
+        v_sync_width = v_sync_end - v_sync_start
+
+        if h_sync_offset > 1023 or h_sync_width > 1023:
+            raise ValueError("Horizontal sync pulse or offset exceeds 10-bit EDID limits")
+        if v_sync_offset > 63 or v_sync_width > 63:
+            raise ValueError("Vertical sync pulse or offset exceeds 6-bit EDID limits")
+
+        v_refresh = (pclk_mhz * 1e6) / (float(h_total) * float(v_total))
+
+        return {
+            "name": name,
+            "pclk_mhz": pclk_mhz,
+            "pclk_10khz": int(round(pclk_mhz * 100)),
+            "h_active": h_active,
+            "h_sync_start": h_sync_start,
+            "h_sync_end": h_sync_end,
+            "h_total": h_total,
+            "h_blank": h_blank,
+            "h_sync_offset": h_sync_offset,
+            "h_sync_width": h_sync_width,
+            "v_active": v_active,
+            "v_sync_start": v_sync_start,
+            "v_sync_end": v_sync_end,
+            "v_total": v_total,
+            "v_blank": v_blank,
+            "v_sync_offset": v_sync_offset,
+            "v_sync_width": v_sync_width,
+            "interlaced": interlaced,
+            "hsync_pos": hsync_pos,
+            "vsync_pos": vsync_pos,
+            "v_refresh": v_refresh,
+        }
+
+    def modeline_to_dtd(m: dict) -> bytes:
+        """Convert parsed modeline timing parameters into an 18-byte EDID Detailed Timing Descriptor."""
+        pclk = m["pclk_10khz"]
+        ha = m["h_active"]
+        hb = m["h_blank"]
+        va = m["v_active"]
+        vb = m["v_blank"]
+        hso = m["h_sync_offset"]
+        hsw = m["h_sync_width"]
+        vso = m["v_sync_offset"]
+        vsw = m["v_sync_width"]
+
+        b0 = pclk & 0xFF
+        b1 = (pclk >> 8) & 0xFF
+        b2 = ha & 0xFF
+        b3 = hb & 0xFF
+        b4 = (((ha >> 8) & 0x0F) << 4) | ((hb >> 8) & 0x0F)
+        b5 = va & 0xFF
+        b6 = vb & 0xFF
+        b7 = (((va >> 8) & 0x0F) << 4) | ((vb >> 8) & 0x0F)
+        b8 = hso & 0xFF
+        b9 = hsw & 0xFF
+        b10 = ((vso & 0x0F) << 4) | (vsw & 0x0F)
+        b11 = (((hso >> 8) & 0x03) << 6) | (((hsw >> 8) & 0x03) << 4) | (((vso >> 4) & 0x03) << 2) | ((vsw >> 4) & 0x03)
+        b12 = 0x58  # Horizontal size in mm (e.g. 600 mm)
+        b13 = 0x54  # Vertical size in mm (e.g. 340 mm)
+        b14 = ((0x02 & 0x0F) << 4) | (0x01 & 0x0F)
+        b15 = 0     # Border H
+        b16 = 0     # Border V
+
+        flags = 0x18  # Digital separate sync
+        if m["interlaced"]:
+            flags |= 0x80
+        if m["vsync_pos"]:
+            flags |= 0x04
+        if m["hsync_pos"]:
+            flags |= 0x02
+        b17 = flags
+
+        return bytes([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17])
+
+    def build_edid_from_modeline(m: dict, monitor_name: str = "") -> bytes:
+        """Synthesize a complete, valid 256-byte CTA-861 EDID with custom Detailed Timing Descriptor."""
+        edid = bytearray(BASE_GC573_EDID)
+        dtd = modeline_to_dtd(m)
+
+        # Place into Block 0 Detailed Timing Descriptor 1 (offset 54..71)
+        edid[54:72] = dtd
+
+        # Update Monitor Name Descriptor in Block 0 (offset 90..107)
+        name = (monitor_name or m["name"] or "Custom").strip()[:13]
+        name_bytes = name.encode("ascii", errors="replace")
+        desc_name = bytearray(b"\x00\x00\x00\xfc\x00" + name_bytes)
+        if len(desc_name) < 18:
+            desc_name.append(0x0A)
+            while len(desc_name) < 18:
+                desc_name.append(0x20)
+        edid[90:108] = desc_name[:18]
+
+        # Recalculate Block 0 checksum
+        edid[127] = (256 - (sum(edid[0:127]) % 256)) % 256
+
+        # Update Block 1 CTA-861 detailed timing slot
+        dtd_start = 128 + edid[130]
+        if dtd_start + 18 <= 255:
+            edid[dtd_start:dtd_start + 18] = dtd
+
+        # Recalculate Block 1 checksum
+        edid[255] = (256 - (sum(edid[128:255]) % 256)) % 256
+
+        return bytes(edid)
+
+    class CustomModelineDialog(QDialog):
+        """Import and validate X11 / xrandr Modeline to generate a custom EDID profile."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Import Custom Modeline (EDID Generator)")
+            self.resize(580, 440)
+            self.setStyleSheet("""
+                QDialog { background-color: #121620; color: #e6e9ef; }
+                QLabel { color: #d0d5e0; }
+                QTextEdit, QLineEdit {
+                    background-color: #1a202c;
+                    border: 1px solid #2d3748;
+                    border-radius: 6px;
+                    color: #ffffff;
+                    padding: 6px;
+                    font-family: monospace;
+                }
+                QPushButton {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #3b668e; }
+            """)
+
+            layout = QVBoxLayout(self)
+
+            lbl_desc = QLabel(
+                "Paste an X11 / xrandr Modeline (e.g. from <code>cvt</code>, <code>gtf</code>, or custom timings). "
+                "EverLive will parse and validate the timings, build an industry-standard 256-byte CTA-861 EDID, "
+                "and save it to <code>~/.config/everlive/edids/custom/</code>."
+            )
+            lbl_desc.setWordWrap(True)
+            layout.addWidget(lbl_desc)
+
+            layout.addWidget(QLabel("Modeline String:"))
+            self.txt_modeline = QTextEdit()
+            self.txt_modeline.setPlaceholderText(
+                'Modeline "1440x1080_120.00"  266.00  1440 1552 1704 1968  1080 1083 1088 1128 -hsync +vsync'
+            )
+            self.txt_modeline.setMaximumHeight(85)
+            self.txt_modeline.textChanged.connect(self._on_text_changed)
+            layout.addWidget(self.txt_modeline)
+
+            h_name = QHBoxLayout()
+            h_name.addWidget(QLabel("Profile / Output Name:"))
+            self.edit_name = QLineEdit("custom_timing")
+            h_name.addWidget(self.edit_name, 1)
+            layout.addLayout(h_name)
+
+            self.lbl_info = QLabel("Enter a valid modeline above to preview timings.")
+            self.lbl_info.setStyleSheet("color: #8a94a6; font-size: 11px;")
+            layout.addWidget(self.lbl_info)
+
+            self.chk_activate = QCheckBox("Set as active EDID profile immediately")
+            self.chk_activate.setChecked(True)
+            layout.addWidget(self.chk_activate)
+
+            layout.addStretch(1)
+
+            h_btns = QHBoxLayout()
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setStyleSheet("background-color: #2a303c;")
+            self.btn_cancel.clicked.connect(self.reject)
+            h_btns.addWidget(self.btn_cancel)
+
+            self.btn_import = QPushButton("Import & Generate EDID")
+            self.btn_import.setEnabled(False)
+            self.btn_import.clicked.connect(self._on_import)
+            h_btns.addWidget(self.btn_import)
+            layout.addLayout(h_btns)
+
+            self.generated_edid_path = ""
+            self.profile_name = ""
+            self._parsed = None
+
+        def _on_text_changed(self):
+            text = self.txt_modeline.toPlainText().strip()
+            if not text:
+                self.lbl_info.setText("Enter a valid modeline above to preview timings.")
+                self.lbl_info.setStyleSheet("color: #8a94a6; font-size: 11px;")
+                self.btn_import.setEnabled(False)
+                self._parsed = None
+                return
+
+            try:
+                m = parse_modeline(text)
+                self._parsed = m
+                msg = (
+                    f"✓ Valid: {m['h_active']}×{m['v_active']}{'i' if m['interlaced'] else 'p'} @ "
+                    f"{m['v_refresh']:.2f} Hz | Clock: {m['pclk_mhz']:.2f} MHz | "
+                    f"HTotal: {m['h_total']}, VTotal: {m['v_total']}"
+                )
+                self.lbl_info.setText(msg)
+                self.lbl_info.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold;")
+                clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', m["name"]).strip('_')
+                if clean_name and (self.edit_name.text() in ("custom_timing", "", m["name"])):
+                    self.edit_name.setText(clean_name)
+                self.btn_import.setEnabled(True)
+            except Exception as e:
+                self._parsed = None
+                self.lbl_info.setText(f"✗ Timing error: {str(e)}")
+                self.lbl_info.setStyleSheet("color: #f87171; font-size: 11px;")
+                self.btn_import.setEnabled(False)
+
+        def _on_import(self):
+            if not self._parsed:
+                return
+            raw_name = self.edit_name.text().strip() or self._parsed["name"]
+            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', raw_name).strip('_')
+            if not clean_name:
+                clean_name = "custom_timing"
+
+            dest_dir = os.path.expanduser("~/.config/everlive/edids/custom")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_file = os.path.join(dest_dir, f"{clean_name}.bin")
+
+            try:
+                edid_bytes = build_edid_from_modeline(self._parsed, clean_name)
+                with open(dest_file, "wb") as f:
+                    f.write(edid_bytes)
+                self.generated_edid_path = dest_file
+                self.profile_name = clean_name
+                self.accept()
+            except Exception as ex:
+                QMessageBox.critical(self, "EDID Generation Failed", f"Failed to save EDID: {ex}")
 
     class _Py_buffer(ctypes.Structure):
         _fields_ = [
@@ -2241,6 +2554,11 @@ if HAS_QT:
             self._last_seq = 0
             self._shm_file = None
             self._shm_mmap = None
+            self._is_gc573_shm = False
+            self._toast_message = ""
+            self._toast_start = 0.0
+            self._toast_duration = 3.0
+            self._prev_has_signal = False
             self._hover_fs = False
             self._fs_btn_rect = QRect()
 
@@ -2280,19 +2598,31 @@ if HAS_QT:
             self.scale_mode = scale or "fit"
             self.update()
 
+        def show_toast(self, message: str, duration: float = 3.0):
+            """Show a semi-transparent floating OSD toast pill on the canvas."""
+            self._toast_message = str(message)
+            self._toast_start = time.monotonic()
+            self._toast_duration = max(0.5, float(duration))
+            self.update()
+
         def poll_frame(self):
+            target_shm = SHM_GC573_NAME if (not self.duo_mode and os.path.exists(SHM_GC573_NAME)) else SHM_NAME
             if self._shm_mmap is None:
-                if not os.path.exists(SHM_NAME):
+                if not os.path.exists(target_shm):
                     if self.is_streaming:
                         self.is_streaming = False
                         self.has_signal = False
                         self._current_qimage = None
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
                         self.update()
                     return
                 try:
-                    self._shm_file = open(SHM_NAME, "rb")
+                    self._shm_file = open(target_shm, "rb")
                     self._shm_mmap = mmap.mmap(
                         self._shm_file.fileno(), 0, prot=mmap.PROT_READ)
+                    self._is_gc573_shm = (target_shm == SHM_GC573_NAME)
                 except Exception:
                     self._shm_file = None
                     self._shm_mmap = None
@@ -2303,31 +2633,47 @@ if HAS_QT:
                 if magic != SHM_MAGIC:
                     return
 
-                # In DUO mode, monitor the alternate port for active HDMI signal
-                if self.duo_mode:
-                    other_port = 1 if self.port == 0 else 0
-                    other_off = SHM_HEADER_SIZE + other_port * SHM_PORT_SIZE
-                    other_w, other_h, other_ns, other_st = struct.unpack_from(
-                        "<IIII", self._shm_mmap, other_off + 16)
-                    if other_st != 0 and other_ns == 0 and other_w > 0:
-                        self.other_port_has_signal = other_port
-                    else:
-                        self.other_port_has_signal = None
+                if self._is_gc573_shm:
+                    port_off = 40
+                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                    if seq & 1 != 0:
+                        return
+                    if seq == self._last_seq and self._current_qimage is not None:
+                        return
+                    width, height, no_signal, streaming, fps_num, fps_den = struct.unpack_from(
+                        "<IIIIII", self._shm_mmap, port_off + 16)
+                    yuy2_off = port_off + 40
+                else:
+                    # In DUO mode, monitor the alternate port for active HDMI signal
+                    if self.duo_mode:
+                        other_port = 1 if self.port == 0 else 0
+                        other_off = SHM_HEADER_SIZE + other_port * SHM_PORT_SIZE
+                        other_w, other_h, other_ns, other_st = struct.unpack_from(
+                            "<IIII", self._shm_mmap, other_off + 16)
+                        if other_st != 0 and other_ns == 0 and other_w > 0:
+                            self.other_port_has_signal = other_port
+                        else:
+                            self.other_port_has_signal = None
 
-                port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
-                seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
-                if seq & 1 != 0:
-                    return
-                if seq == self._last_seq and self._current_qimage is not None:
-                    return
+                    port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
+                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                    if seq & 1 != 0:
+                        return
+                    if seq == self._last_seq and self._current_qimage is not None:
+                        return
 
-                width, height, no_signal, streaming = struct.unpack_from(
-                    "<IIII", self._shm_mmap, port_off + 16)
+                    width, height, no_signal, streaming = struct.unpack_from(
+                        "<IIII", self._shm_mmap, port_off + 16)
+                    yuy2_off = port_off + 32
+
                 if streaming == 0:
                     if self.is_streaming:
                         self.is_streaming = False
                         self.has_signal = False
                         self._current_qimage = None
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
                         self.update()
                     return
 
@@ -2336,7 +2682,10 @@ if HAS_QT:
                     if self.has_signal or self._current_qimage is not None:
                         self.has_signal = False
                         self._current_qimage = None
-                        self.signal_desc = f"No HDMI Signal (Port {self.port + 1})"
+                        self.signal_desc = f"No HDMI Signal (Port {self.port + 1})" if self.duo_mode else "No HDMI Signal"
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
                         self.update()
                     return
 
@@ -2344,9 +2693,11 @@ if HAS_QT:
                 self.current_width = width
                 self.current_height = height
                 self.signal_desc = f"{width}×{height} @ 60 Hz"
+                if not self._prev_has_signal:
+                    self._prev_has_signal = True
+                    self.show_toast(f"HDMI Signal: {self.signal_desc} (Locked)")
 
                 payload_len = width * height * 2
-                yuy2_off = port_off + 32
                 yuy2_slice = memoryview(self._shm_mmap)[yuy2_off : yuy2_off + payload_len]
 
                 post_seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
@@ -2517,6 +2868,35 @@ if HAS_QT:
             painter.setPen(QColor("#ffffff" if self._hover_fs else "#d7dde8"))
             painter.setFont(QFont("sans-serif", 9, QFont.Bold))
             painter.drawText(self._fs_btn_rect, Qt.AlignCenter, "⛶ Fullscreen (F)")
+
+            # Floating toast notification pill inside 16:9 embed (bottom-center)
+            if self._toast_message:
+                elapsed = time.monotonic() - self._toast_start
+                if elapsed < self._toast_duration:
+                    if elapsed < 0.25:
+                        alpha = int((elapsed / 0.25) * 235)
+                    elif elapsed > self._toast_duration - 0.35:
+                        alpha = int(((self._toast_duration - elapsed) / 0.35) * 235)
+                    else:
+                        alpha = 235
+                    alpha = max(0, min(235, alpha))
+
+                    font = QFont("sans-serif", 10, QFont.Bold)
+                    fm = QFontMetrics(font)
+                    text_w = fm.horizontalAdvance(self._toast_message)
+                    pill_w = text_w + 36
+                    pill_h = 32
+                    pill_x = embed_x + (embed_w - pill_w) // 2
+                    pill_y = embed_y + embed_h - pill_h - 20
+                    pill_rect = QRect(pill_x, pill_y, pill_w, pill_h)
+
+                    painter.setPen(QPen(QColor(64, 160, 255, alpha), 1))
+                    painter.setBrush(QColor(14, 20, 32, alpha))
+                    painter.drawRoundedRect(pill_rect, 16, 16)
+
+                    painter.setPen(QColor(240, 245, 255, alpha))
+                    painter.setFont(font)
+                    painter.drawText(pill_rect, Qt.AlignCenter, self._toast_message)
 
         def mouseMoveEvent(self, event):
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -3561,7 +3941,15 @@ if HAS_QT:
             # activated (not currentIndexChanged) so re-picking the custom
             # entry opens the file dialog again.
             self.combo_presets.activated.connect(self.on_preset_changed)
-            grid_video.addWidget(self.combo_presets, 0, 1)
+            h_presets = QHBoxLayout()
+            h_presets.setContentsMargins(0, 0, 0, 0)
+            h_presets.setSpacing(6)
+            h_presets.addWidget(self.combo_presets, 1)
+            self.btn_import_modeline = QPushButton("Import Modeline...")
+            self.btn_import_modeline.setToolTip("Import custom X11/xrandr modeline and generate EDID profile")
+            self.btn_import_modeline.clicked.connect(self.on_import_modeline)
+            h_presets.addWidget(self.btn_import_modeline)
+            grid_video.addLayout(h_presets, 0, 1)
 
             grid_video.addWidget(_field(
                 "Aspect Ratio",
@@ -3586,13 +3974,24 @@ if HAS_QT:
                 "Maps BT.2020 PQ/HLG signals to BT.709 SDR for both the "
                 "gaming window and the OBS loopback feed (hotkey: H)."), 1, 0)
 
+            h_hdr = QHBoxLayout()
+            h_hdr.setContentsMargins(0, 0, 0, 0)
+            h_hdr.setSpacing(8)
             self.chk_hdr = QCheckBox("HDR10 / HLG → SDR")
             self.chk_hdr.setChecked(bool(self.saved_cfg.get("hdr_tonemap", True)))
             self.chk_hdr.setToolTip(
                 "Forwarded as --no-hdr when unchecked. Applies live over IPC "
                 "while the engine runs.")
             self.chk_hdr.toggled.connect(self.on_hdr_toggled)
-            grid_video.addWidget(self.chk_hdr, 1, 1)
+            h_hdr.addWidget(self.chk_hdr)
+
+            self.chk_hdr_passthrough = QCheckBox("Passthrough")
+            self.chk_hdr_passthrough.setChecked(bool(self.saved_cfg.get("hdr_passthrough", False)))
+            self.chk_hdr_passthrough.setToolTip(
+                "Direct BT.2020 PQ/HLG passthrough to HDR-capable displays (bypasses SDR tonemapping).")
+            self.chk_hdr_passthrough.toggled.connect(self.on_hdr_passthrough_toggled)
+            h_hdr.addWidget(self.chk_hdr_passthrough)
+            grid_video.addLayout(h_hdr, 1, 1)
 
             grid_video.addWidget(_field(
                 "Exposure", "Linear exposure bias (-2.0 .. +2.0 EV)."), 1, 2)
@@ -3861,7 +4260,20 @@ if HAS_QT:
                     else:
                         self.combo_led.setEnabled(False)
             self.combo_led.currentIndexChanged.connect(self.on_led_changed)
-            grid_audio.addWidget(self.combo_led, 0, 3)
+            h_led = QHBoxLayout()
+            h_led.setContentsMargins(0, 0, 0, 0)
+            h_led.setSpacing(6)
+            h_led.addWidget(self.combo_led, 1)
+
+            self.btn_custom_led = QPushButton("🎨")
+            self.btn_custom_led.setToolTip("Pick custom RGB color for card LEDs")
+            self.btn_custom_led.setFixedSize(34, 30)
+            self.btn_custom_led.clicked.connect(self.on_pick_custom_led)
+            saved_hex = self.saved_cfg.get("led_custom_hex", "")
+            if saved_hex:
+                self.btn_custom_led.setStyleSheet(f"background-color: {saved_hex}; border-radius: 4px;")
+            h_led.addWidget(self.btn_custom_led)
+            grid_audio.addLayout(h_led, 0, 3)
 
             # --- Section C: outputs, overlay & app ----------------------
             card_out, grid_out = _section("OBS OUTPUTS, OVERLAY & APP")
@@ -4897,23 +5309,85 @@ if HAS_QT:
         def on_hdr_toggled(self, enabled: bool):
             save_settings({"hdr_tonemap": bool(enabled)})
             self.saved_cfg["hdr_tonemap"] = bool(enabled)
+            pt = getattr(self, "chk_hdr_passthrough", None)
+            is_pt = pt.isChecked() if pt else False
             if hasattr(self, "spin_hdr_exposure"):
-                self.spin_hdr_exposure.setEnabled(bool(enabled))
+                self.spin_hdr_exposure.setEnabled(bool(enabled) and not is_pt)
             if hasattr(self, "btn_hdr_exp_minus"):
-                self.btn_hdr_exp_minus.setEnabled(bool(enabled))
+                self.btn_hdr_exp_minus.setEnabled(bool(enabled) and not is_pt)
             if hasattr(self, "btn_hdr_exp_plus"):
-                self.btn_hdr_exp_plus.setEnabled(bool(enabled))
+                self.btn_hdr_exp_plus.setEnabled(bool(enabled) and not is_pt)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_hdr(bool(enabled),
-                                  float(self.spin_hdr_exposure.value()))
+                                  float(self.spin_hdr_exposure.value()),
+                                  passthrough=is_pt)
             elif self.streamer.is_running:
                 print("[*] HDR setting saved; applies on the next start.")
+            self.show_toast(f"HDR Tonemap: {'Auto' if enabled else 'Bypass'}")
+
+        def on_hdr_passthrough_toggled(self, enabled: bool):
+            save_settings({"hdr_passthrough": bool(enabled)})
+            self.saved_cfg["hdr_passthrough"] = bool(enabled)
+            if hasattr(self, "spin_hdr_exposure"):
+                self.spin_hdr_exposure.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if hasattr(self, "btn_hdr_exp_minus"):
+                self.btn_hdr_exp_minus.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if hasattr(self, "btn_hdr_exp_plus"):
+                self.btn_hdr_exp_plus.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if self._ipc is not None and self._ipc.connected:
+                self._ipc.set_hdr(self.chk_hdr.isChecked(),
+                                  float(self.spin_hdr_exposure.value()),
+                                  passthrough=bool(enabled))
+            self.show_toast(f"HDR Passthrough: {'Active' if enabled else 'Off'}")
 
         def on_hdr_exposure_changed(self, value: float):
             save_settings({"hdr_exposure": float(value)})
             self.saved_cfg["hdr_exposure"] = float(value)
+            pt = getattr(self, "chk_hdr_passthrough", None)
+            is_pt = pt.isChecked() if pt else False
             if self._ipc is not None and self._ipc.connected:
-                self._ipc.set_hdr(self.chk_hdr.isChecked(), float(value))
+                self._ipc.set_hdr(self.chk_hdr.isChecked(), float(value), passthrough=is_pt)
+
+        def on_import_modeline(self):
+            dlg = CustomModelineDialog(self)
+            if dlg.exec() == QDialog.Accepted and dlg.generated_edid_path:
+                custom_path = dlg.generated_edid_path
+                clean_name = dlg.profile_name
+                if dlg.chk_activate.isChecked():
+                    self._commit_edid_selection("custom", custom_path)
+                self.show_toast(f"Modeline Imported: {clean_name}")
+
+        def on_pick_custom_led(self):
+            saved_hex = self.saved_cfg.get("led_custom_hex", "#00d8d8")
+            initial = QColor(saved_hex)
+            color = QColorDialog.getColor(initial, self, "Select Card LED Color")
+            if color.isValid():
+                r, g, b = color.red(), color.green(), color.blue()
+                hex_color = color.name()
+                self.saved_cfg["led_custom_hex"] = hex_color
+                self.saved_cfg["led_custom_rgb"] = [r, g, b]
+                save_settings({"led_custom_hex": hex_color, "led_custom_rgb": [r, g, b]})
+                self.btn_custom_led.setStyleSheet(
+                    f"background-color: {hex_color}; border-radius: 4px;"
+                )
+                if self._ipc is not None and self._ipc.connected:
+                    self._ipc.set_led(r, g, b)
+                elif self.vfio_mode:
+                    set_vfio_led(4)
+                self.show_toast(f"LED Color: {hex_color.upper()}")
+
+        def show_toast(self, message: str, duration: float = 3.0):
+            """Trigger an OSD toast notification on both GUI embedded canvas and gaming window."""
+            if hasattr(self, "canvas") and self.canvas is not None:
+                try:
+                    self.canvas.show_toast(message, duration)
+                except Exception:
+                    pass
+            if self._ipc is not None and self._ipc.connected:
+                try:
+                    self._ipc.show_toast(message)
+                except Exception:
+                    pass
 
         # -----------------------------------------------------------------
         # Experimental frame generation & CAS

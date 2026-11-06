@@ -47,6 +47,18 @@ tests/test_ipc_json
 tests/test_edid_unifier
 tests/test_card_registry
 tests/test_frame_convert
+tests/test_hdr
+
+# GC573 userspace engine binaries
+tools/opengc573-userd/gc573_user_streamer
+tools/opengc573-userd/everlive_userd
+tools/opengc573-userd/gc573_user_diag
+tools/opengc573-userd/gc573_user_probe
+tools/opengc573-userd/libgc573-v4l2.so
+
+# Packaging build artifacts
+packaging/AppImage/everlive.AppDir/
+packaging/dist/
 
 # libeverlive-core binaries
 tools/libeverlive-core/*.o

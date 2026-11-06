@@ -25,6 +25,11 @@
 #include <sys/un.h>
 #include <time.h>
 
+/* jsmn JSON parser - single header library (MIT licensed) */
+#define JSMN_HEADER
+#define JSMN_PARENT_LINKS
+#include "third_party/jsmn.h"
+
 /*
  * Experimental socket name: the stable EverLive hub keeps everlive.sock, so a
  * system-tray hub from release 1.3 can never collide with this engine.
@@ -115,192 +120,182 @@ static uint64_t ipc_now_ms(void)
 	return gc573_now_ms();
 }
 
-static const char *skip_ws(const char *p)
+/* JSON parsing with jsmn - limits: 128 tokens, max depth 16, max input 16KB */
+#define IPC_JSON_MAX_TOKENS    128
+#define IPC_JSON_MAX_DEPTH     16
+#define IPC_JSON_MAX_INPUT     (16 * 1024)
+
+typedef enum {
+	JSON_GET_STRING,
+	JSON_GET_LONG,
+	JSON_GET_DOUBLE,
+	JSON_GET_BOOL
+} json_get_type_e;
+
+/* Recursively find a key in the JSON token tree */
+static int json_token_find_recursive(const jsmntok_t *tokens, int tok_count,
+				     int start_idx, const char *key, const char *json)
 {
-	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
-		p++;
-	return p;
+	for (int i = start_idx; i < tok_count; i++) {
+		if (tokens[i].type != JSMN_STRING)
+			continue;
+		int klen = tokens[i].end - tokens[i].start;
+		if (klen == (int)strlen(key) &&
+		    strncmp(json + tokens[i].start, key, klen) == 0) {
+			/* Found key - return the value token (next sibling at same parent) */
+			if (i + 1 < tok_count)
+				return i + 1;
+		}
+		/* If this is an object or array, search inside its direct children */
+		if (tokens[i].type == JSMN_OBJECT || tokens[i].type == JSMN_ARRAY) {
+			for (int j = i + 1; j < tok_count; j++) {
+				if (tokens[j].parent == i) {
+					/* Direct child - search recursively from this child */
+					int found = json_token_find_recursive(tokens, tok_count, j, key, json);
+					if (found >= 0)
+						return found;
+				} else if (tokens[j].parent < i) {
+					/* We've left this object's subtree */
+					break;
+				}
+			}
+		}
+	}
+	return -1;
 }
 
-/*
- * Copy a JSON value token from @p into @out.  Strings keep their quotes, so
- * the result can be embedded in a reply unchanged; numbers, booleans and null
- * are copied up to the next structural character.
- */
-static bool json_copy_token(const char *p, char *out, size_t outsz)
+static bool json_token_to_string(const jsmntok_t *tok, const char *json,
+				 char *out, size_t outsz)
 {
-	const char *start = p;
-	const char *end;
-
-	if (*p == '"') {
-		bool esc = false;
-
-		p++;
-		while (*p) {
-			if (esc) {
-				esc = false;
-				p++;
-				continue;
-			}
-			if (*p == '\\') {
-				esc = true;
-				p++;
-				continue;
-			}
-			if (*p == '"') {
-				p++;
-				break;
-			}
-			p++;
-		}
-		end = p;
-	} else {
-		while (*p && *p != ',' && *p != '}' && *p != ']' &&
-		       *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
-			p++;
-		end = p;
-	}
-
-	size_t len = (size_t)(end - start);
-
-	if (len == 0 || len >= outsz)
+	if (!tok || tok->type != JSMN_STRING)
 		return false;
-	memcpy(out, start, len);
+	int len = tok->end - tok->start;
+	if (len < 0 || (size_t)len >= outsz)
+		return false;
+	memcpy(out, json + tok->start, len);
 	out[len] = '\0';
 	return true;
 }
 
-/*
- * Find "key": <value> in a flat JSON object and copy the raw value token.
- * Key names are matched only in key position, so a string value containing the
- * key name is never mistaken for the key itself.
- */
-static bool json_find_value(const char *s, const char *key, char *out,
-			    size_t outsz)
+static bool json_token_to_long(const jsmntok_t *tok, const char *json,
+			       long *out)
 {
-	const size_t klen = strlen(key);
-	const char *p = s;
-
-	while (*p) {
-		const char *start;
-		const char *end;
-		bool esc = false;
-
-		if (*p != '"') {
-			if (*p == '\\' && p[1]) {
-				p += 2;
-				continue;
-			}
-			p++;
-			continue;
-		}
-
-		start = p + 1;
-		end = start;
-		while (*end) {
-			if (esc) {
-				esc = false;
-				end++;
-				continue;
-			}
-			if (*end == '\\') {
-				esc = true;
-				end++;
-				continue;
-			}
-			if (*end == '"')
-				break;
-			end++;
-		}
-		if (!*end)
-			return false;	/* unterminated string */
-
-		if ((size_t)(end - start) == klen &&
-		    strncmp(start, key, klen) == 0) {
-			const char *q = skip_ws(end + 1);
-
-			if (*q == ':')
-				return json_copy_token(skip_ws(q + 1), out, outsz);
-		}
-		p = end + 1;
-	}
-	return false;
-}
-
-/* Same, but requires a plain JSON string and strips the quotes. */
-static bool json_get_string(const char *s, const char *key, char *out,
-			    size_t outsz)
-{
-	char token[192];
-	size_t len;
-
-	if (!json_find_value(s, key, token, sizeof(token)))
+	if (!tok || tok->type != JSMN_PRIMITIVE)
 		return false;
-	if (token[0] != '"')
+	char buf[64];
+	int len = tok->end - tok->start;
+	if (len < 0 || len >= (int)sizeof(buf))
 		return false;
-	len = strlen(token);
-	if (len < 2 || token[len - 1] != '"')
-		return false;
-	if (len - 1 > outsz)
-		return false;
-	memcpy(out, token + 1, len - 2);
-	out[len - 2] = '\0';
-	return true;
-}
-
-static bool json_get_long(const char *s, const char *key, long *out)
-{
-	char token[32];
+	memcpy(buf, json + tok->start, len);
+	buf[len] = '\0';
 	char *end;
-	long value;
-
-	if (!json_find_value(s, key, token, sizeof(token)))
-		return false;
-	if (token[0] == '"' || token[0] == '\0')
-		return false;
-
 	errno = 0;
-	value = strtol(token, &end, 10);
-	if (errno || end == token || *end != '\0')
+	long val = strtol(buf, &end, 10);
+	if (errno || end == buf || *end != '\0')
 		return false;
-	*out = value;
+	*out = val;
 	return true;
 }
 
-static bool json_get_double(const char *s, const char *key, double *out)
+static bool json_token_to_double(const jsmntok_t *tok, const char *json,
+				 double *out)
 {
-	char token[48];
+	if (!tok || tok->type != JSMN_PRIMITIVE)
+		return false;
+	char buf[64];
+	int len = tok->end - tok->start;
+	if (len < 0 || len >= (int)sizeof(buf))
+		return false;
+	memcpy(buf, json + tok->start, len);
+	buf[len] = '\0';
 	char *end;
-	double value;
-
-	if (!json_find_value(s, key, token, sizeof(token)))
-		return false;
-	if (token[0] == '"' || token[0] == '\0')
-		return false;
-
 	errno = 0;
-	value = strtod(token, &end);
-	if (errno || end == token || *end != '\0')
+	double val = strtod(buf, &end);
+	if (errno || end == buf || *end != '\0')
 		return false;
-	*out = value;
+	*out = val;
 	return true;
 }
 
-static bool json_get_bool(const char *s, const char *key, bool *out)
+static bool json_token_to_bool(const jsmntok_t *tok, const char *json,
+			       bool *out)
 {
-	char token[16];
-
-	if (!json_find_value(s, key, token, sizeof(token)))
+	if (!tok || tok->type != JSMN_PRIMITIVE)
 		return false;
-	if (strcmp(token, "true") == 0) {
+	int len = tok->end - tok->start;
+	if (len == 4 && strncmp(json + tok->start, "true", 4) == 0) {
 		*out = true;
 		return true;
 	}
-	if (strcmp(token, "false") == 0) {
+	if (len == 5 && strncmp(json + tok->start, "false", 5) == 0) {
 		*out = false;
 		return true;
 	}
 	return false;
+}
+
+static bool json_parse_request(const char *input, size_t len,
+			       const char *key, char *out, size_t outsz,
+			       json_get_type_e type, void *num_out)
+{
+	if (len >= IPC_JSON_MAX_INPUT)
+		return false;
+
+	jsmn_parser parser;
+	jsmntok_t tokens[IPC_JSON_MAX_TOKENS];
+	jsmn_init(&parser);
+	int tok_count = jsmn_parse(&parser, input, len, tokens, IPC_JSON_MAX_TOKENS);
+	if (tok_count < 1 || tokens[0].type != JSMN_OBJECT)
+		return false;
+
+	/* Recursively search for the key anywhere in the JSON */
+	int val_idx = json_token_find_recursive(tokens, tok_count, 1, key, input);
+	if (val_idx < 0)
+		return false;
+
+	const jsmntok_t *val = &tokens[val_idx];
+	switch (type) {
+	case JSON_GET_STRING:
+		return json_token_to_string(val, input, out, outsz);
+	case JSON_GET_LONG:
+		return json_token_to_long(val, input, (long *)num_out);
+	case JSON_GET_DOUBLE:
+		return json_token_to_double(val, input, (double *)num_out);
+	case JSON_GET_BOOL:
+		return json_token_to_bool(val, input, (bool *)num_out);
+	}
+	return false;
+}
+
+static bool json_get_string(const char *s, const char *key, char *out, size_t outsz)
+{
+	return json_parse_request(s, strlen(s), key, out, outsz, JSON_GET_STRING, NULL);
+}
+
+static bool json_get_long(const char *s, const char *key, long *out)
+{
+	return json_parse_request(s, strlen(s), key, NULL, 0, JSON_GET_LONG, out);
+}
+
+static bool json_get_double(const char *s, const char *key, double *out)
+{
+	return json_parse_request(s, strlen(s), key, NULL, 0, JSON_GET_DOUBLE, out);
+}
+
+static bool json_get_bool(const char *s, const char *key, bool *out)
+{
+	return json_parse_request(s, strlen(s), key, NULL, 0, JSON_GET_BOOL, out);
+}
+
+/* Legacy wrapper for json_find_value (used in ipc_handle_line for "id" and "method") */
+static bool json_find_value(const char *s, const char *key, char *out, size_t outsz)
+{
+	/* For "id" and "method", we need raw token including quotes for id */
+	if (strcmp(key, "method") == 0) {
+		return json_get_string(s, key, out, outsz);
+	}
+	/* For "id", return raw token */
+	return json_parse_request(s, strlen(s), key, out, outsz, JSON_GET_STRING, NULL);
 }
 
 static void json_escape_into(char *dst, size_t dstsz, const char *src)
@@ -587,7 +582,7 @@ static void ipc_send_hello(struct ipc_server *s, struct ipc_client *c,
 		     "\"led.set\",\"led.mode.set\",\"audio.volume.set\","
 		     "\"audio.mute.set\",\"osd.set\",\"osd.position.set\","
 		     "\"aspect.set\",\"mode.set\",\"v4l2.set\","
-		     "\"hdr.set\",\"scale.set\",\"framegen.set\"]}",
+		     "\"hdr.set\",\"hdr.passthrough\",\"scale.set\",\"framegen.set\",\"toast.show\"]}",
 		     GC573_IPC_PROTO_VERSION, s->version, (long)getpid(),
 		     path_esc);
 	if (n > 0 && (size_t)n < sizeof(result))
@@ -814,20 +809,27 @@ static void ipc_handle_hdr(struct ipc_client *c, const char *id,
 	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_HDR };
 	char mode[16];
 	double exposure = 0.0;
+	bool passthrough = false;
 
 	if (!json_get_string(line, "mode", mode, sizeof(mode))) {
 		ipc_error(c, id, -32602, "invalid params: mode required");
 		return;
 	}
 
-	if (!strcasecmp(mode, "auto") || !strcasecmp(mode, "on"))
+	if (!strcasecmp(mode, "auto") || !strcasecmp(mode, "on")) {
 		cmd.a = 1;
-	else if (!strcasecmp(mode, "off") || !strcasecmp(mode, "bypass"))
+	} else if (!strcasecmp(mode, "passthrough")) {
+		cmd.a = 1;
+		cmd.b = 1;
+	} else if (!strcasecmp(mode, "off") || !strcasecmp(mode, "bypass")) {
 		cmd.a = 0;
-	else {
-		ipc_error(c, id, -32602, "unknown mode: auto|off");
+	} else {
+		ipc_error(c, id, -32602, "unknown mode: auto|off|passthrough");
 		return;
 	}
+
+	if (json_get_bool(line, "passthrough", &passthrough))
+		cmd.b = passthrough ? 1 : 0;
 
 	if (json_get_double(line, "exposure", &exposure)) {
 		if (exposure < -2.0)
@@ -837,6 +839,25 @@ static void ipc_handle_hdr(struct ipc_client *c, const char *id,
 		cmd.f = (float)exposure;
 	}
 
+	ipc_push_and_reply(c, id, &cmd);
+}
+
+static void ipc_handle_hdr_passthrough(struct ipc_client *c, const char *id,
+				       const char *line)
+{
+	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_HDR };
+	bool enable = false;
+
+	if (!json_get_bool(line, "enabled", &enable) &&
+	    !json_get_bool(line, "passthrough", &enable)) {
+		char mode[16];
+		if (json_get_string(line, "mode", mode, sizeof(mode)))
+			enable = (!strcasecmp(mode, "on") || !strcasecmp(mode, "true") ||
+				  !strcasecmp(mode, "passthrough"));
+	}
+
+	cmd.a = 1; /* keep HDR active */
+	cmd.b = enable ? 1 : 0;
 	ipc_push_and_reply(c, id, &cmd);
 }
 
@@ -931,14 +952,34 @@ static void ipc_handle_v4l2(struct ipc_client *c, const char *id,
 	cmd.a = enabled ? 1 : 0;
 
 	if (json_get_string(line, "device", device, sizeof(device))) {
-		/* Only character devices; no traversal, no relative paths. */
-		if (strncmp(device, "/dev/", 5) != 0 ||
-		    strstr(device, "..") != NULL) {
-			ipc_error(c, id, -32602,
-				  "device must be an absolute /dev/ path");
+		/* Only character devices; allowlist /dev/video[0-9]+ */
+		if (strncmp(device, "/dev/video", 10) != 0) {
+			ipc_error(c, id, -32602, "device must match /dev/video[0-9]+");
 			return;
 		}
+		for (const char *p = device + 10; *p; p++) {
+			if (*p < '0' || *p > '9') {
+				ipc_error(c, id, -32602, "device must match /dev/video[0-9]+");
+				return;
+			}
+		}
 		snprintf(cmd.path, sizeof(cmd.path), "%s", device);
+	}
+
+	ipc_push_and_reply(c, id, &cmd);
+}
+
+static void ipc_handle_toast_show(struct ipc_client *c, const char *id,
+				   const char *line)
+{
+	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_TOAST };
+	char msg[64] = { 0 };
+
+	if (json_get_string(line, "message", msg, sizeof(msg)) ||
+	    json_get_string(line, "text", msg, sizeof(msg))) {
+		snprintf(cmd.path, sizeof(cmd.path), "%s", msg);
+	} else {
+		snprintf(cmd.path, sizeof(cmd.path), "Notification");
 	}
 
 	ipc_push_and_reply(c, id, &cmd);
@@ -985,10 +1026,14 @@ static void ipc_handle_line(struct ipc_server *s, struct ipc_client *c,
 		ipc_handle_v4l2(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "hdr.set") == 0) {
 		ipc_handle_hdr(c, has_id ? id : NULL, line);
+	} else if (strcmp(method, "hdr.passthrough") == 0) {
+		ipc_handle_hdr_passthrough(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "scale.set") == 0) {
 		ipc_handle_scale(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "framegen.set") == 0) {
 		ipc_handle_framegen(c, has_id ? id : NULL, line);
+	} else if (strcmp(method, "toast.show") == 0) {
+		ipc_handle_toast_show(c, has_id ? id : NULL, line);
 	} else {
 		ipc_error(c, has_id ? id : NULL, -32601, "method not found");
 	}
