@@ -22,9 +22,11 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/utils/result.h>
+#include <dirent.h>
+#include <signal.h>
 #include <sys/wait.h>
 
-#define TAP_RING_BYTES		65536U	/* power of two, ~340 ms at 48 kHz stereo */
+#define TAP_RING_BYTES		262144U	/* power of two, ~340 ms at 48 kHz 8 ch */
 #define TAP_SAMPLE_BYTES	2U
 #define TAP_MAX_CHANNELS	8U
 
@@ -266,6 +268,54 @@ static void tap_teardown_locked(struct gc573_audio_tap *tap)
 }
 
 /*
+ * Close any inherited descriptors above STDERR_FILENO before executing
+ * helper processes (pactl / pw-cli).
+ */
+static void close_extra_fds(void)
+{
+	DIR *dir = opendir("/proc/self/fd");
+	if (dir) {
+		int dir_fd = dirfd(dir);
+		struct dirent *entry;
+
+		while ((entry = readdir(dir))) {
+			char *end;
+			long fd = strtol(entry->d_name, &end, 10);
+			if (*end != '\0' || fd <= 2 || fd == dir_fd)
+				continue;
+			close((int)fd);
+		}
+		closedir(dir);
+	} else {
+		int max_fd = (int)sysconf(_SC_OPEN_MAX);
+		if (max_fd < 0 || max_fd > 4096)
+			max_fd = 4096;
+		for (int fd = 3; fd < max_fd; fd++)
+			close(fd);
+	}
+}
+
+/*
+ * Bounded waitpid helper to ensure a hung pactl/pw-cli never stalls the audio thread.
+ */
+static pid_t timed_waitpid(pid_t pid, int *status, int timeout_ms)
+{
+	int step_ms = 10;
+	int elapsed = 0;
+
+	while (elapsed < timeout_ms) {
+		pid_t res = waitpid(pid, status, WNOHANG);
+		if (res != 0)
+			return res;
+		usleep(step_ms * 1000);
+		elapsed += step_ms;
+	}
+
+	kill(pid, SIGKILL);
+	return waitpid(pid, status, 0);
+}
+
+/*
  * Create the sink in-process when the config drop-in is not installed.
  *
  * We try `pactl load-module module-null-sink` first: modules loaded through
@@ -284,9 +334,10 @@ static void tap_ensure_sink(struct gc573_audio_tap *tap)
 
 	snprintf(sink_arg, sizeof(sink_arg), "sink_name=%s", tap->node_name);
 
-	/* 1. Try pactl */
+	/* 1. Try pactl. Eight channels keeps 5.1/7.1 intact for OBS. */
 	pid = fork();
 	if (pid == 0) {
+		close_extra_fds();
 		int devnull = open("/dev/null", O_RDWR);
 
 		if (devnull >= 0) {
@@ -297,8 +348,8 @@ static void tap_ensure_sink(struct gc573_audio_tap *tap)
 		}
 		execlp("pactl", "pactl", "load-module",
 		       "module-null-sink", sink_arg,
-		       "channels=6",
-		       "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right",
+		       "channels=8",
+		       "channel_map=front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
 		       "sink_properties=device.description=\"EverLive Capture Audio\"",
 		       (char *)NULL);
 		_exit(127);
@@ -307,7 +358,7 @@ static void tap_ensure_sink(struct gc573_audio_tap *tap)
 	if (pid > 0) {
 		int status = 0;
 
-		if (waitpid(pid, &status, 0) > 0 &&
+		if (timed_waitpid(pid, &status, 1500) > 0 &&
 		    WIFEXITED(status) && WEXITSTATUS(status) == 0) {
 			pr_info("Audio tap: created persistent sink '%s' via pactl",
 				tap->node_name);
@@ -321,13 +372,14 @@ static void tap_ensure_sink(struct gc573_audio_tap *tap)
 		 "node.name = %s "
 		 "node.description = \"EverLive Capture Audio\" "
 		 "media.class = Audio/Sink "
-		 "audio.position = [ FL FR FC LFE RL RR ] "
+		 "audio.position = [ FL FR FC LFE RL RR SL SR ] "
 		 "monitor.channel-volumes = true "
 		 "node.virtual = false }",
 		 tap->node_name);
 
 	pid = fork();
 	if (pid == 0) {
+		close_extra_fds();
 		int devnull = open("/dev/null", O_RDWR);
 
 		if (devnull >= 0) {
@@ -344,7 +396,7 @@ static void tap_ensure_sink(struct gc573_audio_tap *tap)
 	if (pid > 0) {
 		int status = 0;
 
-		if (waitpid(pid, &status, 0) > 0 &&
+		if (timed_waitpid(pid, &status, 1500) > 0 &&
 		    WIFEXITED(status) && WEXITSTATUS(status) == 0) {
 			pr_info("Audio tap: created sink '%s' via pw-cli",
 				tap->node_name);

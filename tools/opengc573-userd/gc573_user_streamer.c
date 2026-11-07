@@ -27,6 +27,7 @@
 #include "gc573_user_nosignal.h"
 #include "gc573_user_ipc.h"
 #include "gc573_user_audio_tap.h"
+#include "gc573_user_video_tap.h"
 #include "gc573_user_hdr.h"
 #include "gc573_user_framegen.h"
 #include "gc573_user_font8x8.h"
@@ -3143,6 +3144,19 @@ static void render_standby(SDL_Window *window, SDL_Renderer *renderer,
 	standby_present(window, renderer, g_standby_sink, message, true);
 }
 
+static void gc573_video_tap_publish(const void *pixels, size_t bytes,
+				     unsigned int width, unsigned int height,
+				     unsigned int fps_num, unsigned int fps_den)
+{
+	if (gc573_video_tap_active() && pixels && width && height) {
+		unsigned int rate_x100 = 6000;
+		if (fps_den > 0 && fps_num > 0)
+			rate_x100 = (unsigned int)((uint64_t)fps_den * 100ULL / fps_num);
+		gc573_video_tap_set_format(width, height, rate_x100);
+		gc573_video_tap_write(pixels, bytes, width, height);
+	}
+}
+
 /*
  * Periodic standby tick for the idle loop: redraws at ~30 fps and keeps the
  * loopback feed alive without blocking event handling.
@@ -4371,6 +4385,13 @@ static void audio_handle_format(struct audio_stream *as,
 		as->retry_after = now + AUDIO_RETRY_MS;
 		return;
 	}
+
+	/*
+	 * The capture tap mirrors the source layout.  Compressed carriers are
+	 * decoded to stereo, so their tap stays 2 ch at the decoder rate.
+	 */
+	gc573_audio_tap_set_format(bitstream ? 48000 : format->rate_hz,
+				   bitstream ? 2 : format->channels);
 
 	if (as->lock_ready)
 		pthread_mutex_lock(&as->lock);
@@ -5615,6 +5636,7 @@ int main(int argc, char *argv[])
 	const char *v4l2_device = NULL;
 	const char *ipc_socket_override = NULL;
 	const char *audio_tap_node = NULL;
+	const char *video_tap_node = NULL;
 	bool ipc_disabled = false;
 	struct gc573_vfio_ctx ctx;
 	struct gc573_user_video video;
@@ -5760,6 +5782,15 @@ int main(int argc, char *argv[])
 				fprintf(stderr,
 					"[AUDIO] Unknown channel mode '%s'; using auto\n",
 					argv[i] + 17);
+		} else if (strcmp(argv[i], "--video-tap") == 0) {
+			if (i + 1 < argc && argv[i + 1][0] != '-')
+				video_tap_node = argv[++i];
+			else
+				video_tap_node = GC573_VIDEO_TAP_DEFAULT;
+		} else if (strncmp(argv[i], "--video-tap=", 12) == 0) {
+			video_tap_node = argv[i] + 12;
+		} else if (strcmp(argv[i], "--no-video-tap") == 0) {
+			video_tap_node = NULL;
 		} else if (strcmp(argv[i], "-f") == 0 ||
 			   strcmp(argv[i], "--fullscreen") == 0) {
 			g_fullscreen = true;
@@ -6173,6 +6204,14 @@ int main(int argc, char *argv[])
 		if (tap_ret < 0)
 			pr_warn("Audio tap unavailable (%s); continuing without it",
 				strerror(-tap_ret));
+	}
+
+	if (video_tap_node) {
+		int vtap_ret = gc573_video_tap_start(video_tap_node);
+
+		if (vtap_ret < 0)
+			pr_warn("Video tap unavailable (%s); continuing without it",
+				strerror(-vtap_ret));
 	}
 
 	last_stats = now_ms();
@@ -6846,6 +6885,10 @@ int main(int argc, char *argv[])
 				 * present would make it interpolate a frozen pair.
 				 */
 				if (gc573_framegen_take(g_framegen, &fg_pixels)) {
+					gc573_video_tap_publish(fg_pixels,
+								(size_t)output_width * output_height * 2,
+								output_width, output_height,
+								1, (unsigned int)(displayed_fps > 0 ? displayed_fps : 60));
 					if (texture && output_width && output_height) {
 						if (SDL_UpdateTexture(texture, NULL,
 								      fg_pixels,
@@ -6913,6 +6956,10 @@ int main(int argc, char *argv[])
 							&v4l2_sink, pixels,
 							g_preview.bytes, output_width,
 							output_height);
+					gc573_video_tap_publish(pixels,
+								g_preview.bytes,
+								output_width, output_height,
+								1, (unsigned int)(displayed_fps > 0 ? displayed_fps : 60));
 					if (texture) {
 						int uret = SDL_UpdateTexture(
 							texture, NULL, pixels,
@@ -7172,6 +7219,7 @@ int main(int argc, char *argv[])
 	 * notices within one poll interval that the session ended. */
 	gc573_ipc_stop();
 	gc573_audio_tap_stop();
+	gc573_video_tap_stop();
 
 	if (g_trace_requested) {
 		v4l2_pump_stop();
