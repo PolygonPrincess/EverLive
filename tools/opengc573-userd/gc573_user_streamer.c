@@ -27,6 +27,7 @@
 #include "gc573_user_nosignal.h"
 #include "gc573_user_ipc.h"
 #include "gc573_user_audio_tap.h"
+#include "gc573_user_video_tap.h"
 #include "gc573_user_hdr.h"
 #include "gc573_user_framegen.h"
 #include "gc573_user_font8x8.h"
@@ -3053,6 +3054,19 @@ static void render_standby(SDL_Window *window, SDL_Renderer *renderer,
 	standby_present(window, renderer, g_standby_sink, message, true);
 }
 
+static void gc573_video_tap_publish(const void *pixels, size_t bytes,
+				     unsigned int width, unsigned int height,
+				     unsigned int fps_num, unsigned int fps_den)
+{
+	if (gc573_video_tap_active() && pixels && width && height) {
+		unsigned int rate_x100 = 6000;
+		if (fps_den > 0 && fps_num > 0)
+			rate_x100 = (unsigned int)((uint64_t)fps_den * 100ULL / fps_num);
+		gc573_video_tap_set_format(width, height, rate_x100);
+		gc573_video_tap_write(pixels, bytes, width, height);
+	}
+}
+
 /*
  * Periodic standby tick for the idle loop: redraws at ~30 fps and keeps the
  * loopback feed alive without blocking event handling.
@@ -3184,7 +3198,6 @@ static int audio_open_device(struct audio_playback *playback,
 	playback->bits = (int)sample_bits;
 	playback->bytes_per_frame = (sample_bits / 8U) * 2U;
 	playback->primed = false;
-	gc573_audio_tap_set_format((unsigned int)playback->rate);
 	/* Stay paused until audio_queue_pcm_bytes() has built the cushion. */
 	SDL_PauseAudioDevice(playback->dev, 1);
 	pr_info("SDL audio: opened %u Hz, 2 ch, %u-bit via %s (cushion %u ms)",
@@ -3592,12 +3605,6 @@ static void audio_queue_pcm_bytes(struct audio_stream *as, const void *data,
 
 	data = audio_apply_gain(as, data, bytes);
 
-	/*
-	 * Mirror exactly what SDL is about to play.  The tap normalises to S16
-	 * and never feeds back into the playback path.
-	 */
-	gc573_audio_tap_write(data, bytes, (unsigned int)playback->bits);
-
 	if (SDL_QueueAudio(playback->dev, data, (Uint32)bytes) < 0) {
 		if (!playback->queue_error_reported) {
 			pr_warn("SDL audio: SDL_QueueAudio failed: %s",
@@ -3668,6 +3675,8 @@ static bool audio_bitstream_prepare(struct audio_stream *as)
 	    audio_open_device(&as->playback, 48000, 16) < 0)
 		return false;
 
+	/* Decoded output is stereo even when the carrier is 5.1/7.1. */
+	gc573_audio_tap_set_format(48000, 2);
 	return true;
 }
 
@@ -3687,6 +3696,9 @@ static void audio_bitstream_decode(struct audio_stream *as,
 		return;
 	if (!out_bytes)
 		return;
+
+	/* Decoded AC-3/DTS output is always stereo S16. */
+	gc573_audio_tap_write(as->playback.scratch, out_bytes, 2, 2, 2);
 
 	as->bt_playing = true;
 	audio_queue_pcm_bytes(as, as->playback.scratch, out_bytes);
@@ -3821,6 +3833,17 @@ static void audio_queue_block(struct audio_stream *as, const void *data,
 	/* Ambiguous carriers stay silent until the LPCM window confirmed. */
 	if (!as->lpcm_verified)
 		return;
+
+	/*
+	 * Capture tap receives the native PCM data before the SDL fold-down,
+	 * forwarding multichannel (5.1 or 7.1) directly in the negotiated
+	 * layout. A 6-channel source still arrives in the FPGA's 8-slot
+	 * layout, which the tap compacts down to 6 published channels.
+	 */
+	if (as->format_channels && as->dma.dma_channels && as->dma.sample_bytes)
+		gc573_audio_tap_write(data, bytes, as->dma.sample_bytes,
+				      as->dma.dma_channels,
+				      as->format_channels);
 
 	if (!playback->dev)
 		return;
@@ -4003,6 +4026,13 @@ static void audio_handle_format(struct audio_stream *as,
 		as->retry_after = now + AUDIO_RETRY_MS;
 		return;
 	}
+
+	/*
+	 * The capture tap mirrors the source layout.  Compressed carriers are
+	 * decoded to stereo, so their tap stays 2 ch at the decoder rate.
+	 */
+	gc573_audio_tap_set_format(bitstream ? 48000 : format->rate_hz,
+				   bitstream ? 2 : format->channels);
 
 	if (as->lock_ready)
 		pthread_mutex_lock(&as->lock);
@@ -5229,6 +5259,7 @@ int main(int argc, char *argv[])
 	const char *v4l2_device = NULL;
 	const char *ipc_socket_override = NULL;
 	const char *audio_tap_node = NULL;
+	const char *video_tap_node = NULL;
 	bool ipc_disabled = false;
 	struct gc573_vfio_ctx ctx;
 	struct gc573_user_video video;
@@ -5361,6 +5392,15 @@ int main(int argc, char *argv[])
 				audio_tap_node = GC573_AUDIO_TAP_DEFAULT;
 		} else if (strncmp(argv[i], "--audio-tap=", 12) == 0) {
 			audio_tap_node = argv[i] + 12;
+		} else if (strcmp(argv[i], "--video-tap") == 0) {
+			if (i + 1 < argc && argv[i + 1][0] != '-')
+				video_tap_node = argv[++i];
+			else
+				video_tap_node = GC573_VIDEO_TAP_DEFAULT;
+		} else if (strncmp(argv[i], "--video-tap=", 12) == 0) {
+			video_tap_node = argv[i] + 12;
+		} else if (strcmp(argv[i], "--no-video-tap") == 0) {
+			video_tap_node = NULL;
 		} else if (strcmp(argv[i], "-f") == 0 ||
 			   strcmp(argv[i], "--fullscreen") == 0) {
 			g_fullscreen = true;
@@ -5772,6 +5812,14 @@ int main(int argc, char *argv[])
 		if (tap_ret < 0)
 			pr_warn("Audio tap unavailable (%s); continuing without it",
 				strerror(-tap_ret));
+	}
+
+	if (video_tap_node) {
+		int vtap_ret = gc573_video_tap_start(video_tap_node);
+
+		if (vtap_ret < 0)
+			pr_warn("Video tap unavailable (%s); continuing without it",
+				strerror(-vtap_ret));
 	}
 
 	last_stats = now_ms();
@@ -6445,6 +6493,10 @@ int main(int argc, char *argv[])
 				 * present would make it interpolate a frozen pair.
 				 */
 				if (gc573_framegen_take(g_framegen, &fg_pixels)) {
+					gc573_video_tap_publish(fg_pixels,
+								(size_t)output_width * output_height * 2,
+								output_width, output_height,
+								1, (unsigned int)(displayed_fps > 0 ? displayed_fps : 60));
 					if (texture && output_width && output_height) {
 						if (SDL_UpdateTexture(texture, NULL,
 								      fg_pixels,
@@ -6512,6 +6564,10 @@ int main(int argc, char *argv[])
 							&v4l2_sink, pixels,
 							g_preview.bytes, output_width,
 							output_height);
+					gc573_video_tap_publish(pixels,
+								g_preview.bytes,
+								output_width, output_height,
+								1, (unsigned int)(displayed_fps > 0 ? displayed_fps : 60));
 					if (texture) {
 						int uret = SDL_UpdateTexture(
 							texture, NULL, pixels,
@@ -6769,6 +6825,7 @@ int main(int argc, char *argv[])
 	 * notices within one poll interval that the session ended. */
 	gc573_ipc_stop();
 	gc573_audio_tap_stop();
+	gc573_video_tap_stop();
 
 	if (g_trace_requested) {
 		v4l2_pump_stop();
