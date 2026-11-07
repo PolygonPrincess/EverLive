@@ -66,3 +66,11 @@ jobs:
           bash -n tools/opengc573-userd/vfio_pci_bind.sh
           bash -n tools/opengc570d-userd/gc570d-vfio-bind.sh
           bash -n tools/opengc570d-userd/gc570d-sleep.sh
+          bash -n packaging/build_appimage.sh
+          bash -n packaging/AppImage/AppRun
+
+      - name: Test AppImage AppDir staging
+        run: |
+          ./packaging/build_appimage.sh --appdir-only
+          test -x packaging/AppImage/everlive.AppDir/AppRun
+          test -f packaging/AppImage/everlive.AppDir/everlive.desktop

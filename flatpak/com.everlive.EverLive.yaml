@@ -1,0 +1,105 @@
+app-id: com.everlive.EverLive
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: everlive
+
+finish-args:
+  # Inter-Process Communication & Display
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --socket=fallback-x11
+
+  # Audio subsystems
+  - --socket=pulseaudio
+  - --socket=pipewire
+
+  # GPU & Hardware Acceleration
+  - --device=dri
+  - --device=all
+
+  # Shared memory & userspace IPC
+  - --filesystem=/dev/shm
+  - --filesystem=xdg-run/everlive:create
+  - --filesystem=xdg-config/everlive:create
+  - --filesystem=xdg-data/everlive:create
+
+modules:
+  # FFmpeg / libavcodec headers and libraries for compressed bitstream audio decoding
+  - name: ffmpeg
+    cleanup:
+      - /bin
+      - /share/ffmpeg
+    config-opts:
+      - --enable-shared
+      - --disable-static
+      - --disable-programs
+      - --disable-doc
+      - --enable-swresample
+      - --enable-swscale
+      - --enable-avcodec
+      - --enable-avutil
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+        sha256: 40973d44970adb83ef76e5da61ff0561e1451f1585803719ec244677467657d4
+
+  # SDL2 for low-latency zero-copy presentation & audio playback
+  - name: sdl2
+    cleanup:
+      - /bin
+    config-opts:
+      - --enable-shared
+      - --disable-static
+      - --enable-video-x11
+      - --enable-video-wayland
+      - --enable-video-vulkan
+      - --enable-pulseaudio
+      - --enable-pipewire
+    sources:
+      - type: archive
+        url: https://github.com/libsdl-org/SDL/releases/download/release-2.30.9/SDL2-2.30.9.tar.gz
+        sha256: 236f23554449836361a3d9ae756cb8e30b422a57ae7c3bc5e5d36e2f7b44f0b7
+
+  # EverLive core engine & viewer application
+  - name: everlive
+    buildsystem: simple
+    build-commands:
+      # Compile C userspace streaming engines and preload libraries
+      - make -C tools/opengc573-userd -j$(nproc)
+      - make -C tools/opengc570d-userd CC=gcc -j$(nproc)
+      - if [ -d tools/libeverlive-core ]; then make -C tools/libeverlive-core -j$(nproc); fi
+
+      # Install binaries and shared libraries into /app
+      - install -d /app/bin /app/lib/everlive /app/share/applications /app/share/icons/hicolor/scalable/apps /app/share/metainfo
+      - install -m 755 tools/opengc573-userd/gc573_user_streamer /app/bin/gc573_user_streamer
+      - install -m 755 tools/opengc573-userd/everlive_userd /app/bin/everlive_userd
+      - install -m 755 tools/opengc573-userd/gc573_user_diag /app/bin/gc573_user_diag
+      - if [ -f tools/opengc573-userd/libgc573-v4l2.so ]; then install -m 755 tools/opengc573-userd/libgc573-v4l2.so /app/lib/libgc573-v4l2.so && ln -sf /app/lib/libgc573-v4l2.so /app/lib/libeverlive-v4l2.so; fi
+      - install -m 755 tools/opengc570d-userd/opengc570d-userd /app/bin/opengc570d-userd
+      - install -m 755 tools/opengc570d-userd/gc570d-ctl /app/bin/gc570d-ctl
+      - install -m 755 tools/opengc570d-userd/libgc570d-v4l2.so /app/lib/libgc570d-v4l2.so
+      - if [ -d tools/libeverlive-core ]; then install -m 755 tools/libeverlive-core/everlive-ctl /app/bin/ 2>/dev/null || true; install -m 755 tools/libeverlive-core/libeverlive_core.so /app/lib/ 2>/dev/null || true; fi
+
+      # Install Python GUI viewer
+      - cp -r tools/everlive/* /app/lib/everlive/
+      - install -m 755 play.sh /app/lib/everlive/play.sh
+
+      # Wrapper launcher script
+      - |
+        cat << 'EOF' > /app/bin/everlive
+        #!/bin/bash
+        export LD_LIBRARY_PATH="/app/lib:${LD_LIBRARY_PATH}"
+        export PYTHONPATH="/app/lib/everlive:${PYTHONPATH}"
+        exec python3 /app/lib/everlive/everlive_viewer.py "$@"
+        EOF
+        chmod +x /app/bin/everlive
+
+      # Desktop entry and metadata
+      - install -m 644 flatpak/com.everlive.EverLive.desktop /app/share/applications/com.everlive.EverLive.desktop
+      - install -m 644 tools/everlive/icons/scalable/apps/everlive.png /app/share/icons/hicolor/scalable/apps/com.everlive.EverLive.png
+      - install -m 644 flatpak/com.everlive.EverLive.metainfo.xml /app/share/metainfo/com.everlive.EverLive.metainfo.xml
+    sources:
+      - type: dir
+        path: ../
