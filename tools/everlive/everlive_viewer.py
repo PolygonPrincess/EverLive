@@ -14,7 +14,19 @@ import argparse
 import re
 import json
 import shutil
+import mmap
+import ctypes
+import struct
+import math
+import queue
+import threading
 from typing import Optional, Tuple, Dict
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 try:
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
@@ -34,13 +46,22 @@ GC573_SUBSYSTEM_ID = "0x5730"
 MODEL_GC573 = "gc573"
 MODEL_GC570D = "gc570d"
 MODEL_NAMES = {
-    MODEL_GC573: "GC573 · LIVE GAMER 4K",
-    MODEL_GC570D: "GC570D · LIVE GAMER DUO",
+    MODEL_GC573: "GC573 · Live Gamer 4K",
+    MODEL_GC570D: "GC570D · Live Gamer DUO",
 }
 ENGINE_VFIO_TEXT = "● Userspace VFIO"
 V4L2_DEFAULT_DEVICE = "/dev/video10"
 V4L2_DUO_SECOND_DEVICE = "/dev/video11"
 AUDIO_TAP_NODE = "everlive-capture-audio"
+
+SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
+SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
+SHM_MAGIC = 0x47433537  # "GC57"
+SHM_HEADER_SIZE = 40
+SHM_PORT_HEADER_SIZE = 48
+SHM_FRAME_BYTES = 1920 * 1080 * 2
+SHM_SLOTS = 3
+SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_SLOTS * SHM_FRAME_BYTES
 
 ASPECT_OPTIONS = [
     ("Auto (Native HDMI)", "auto"),
@@ -64,11 +85,11 @@ SCALE_OPTIONS = [
 ]
 SCALE_MODES = {key for _, key in SCALE_OPTIONS}
 
-# lsfg-vk frame generation (gc573_user_streamer --framegen).
+# Experimental lsfg-vk frame generation (gc573_user_streamer --framegen).
 FRAMEGEN_OPTIONS = [
     ("Off — Native Ultra-Low Latency", "off"),
-    ("60 → 120 FPS (Beta · LSFG 2x · 60 FPS Games)", "60to120"),
-    ("30 → 60 FPS (Beta · LSFG 2x · PS5 30 FPS Games)", "30to60"),
+    ("60 → 120 FPS (LSFG 2x · 60 FPS Games)", "60to120"),
+    ("30 → 60 FPS (LSFG 2x · PS5 30 FPS Games)", "30to60"),
 ]
 FRAMEGEN_KEYS = {key for _, key in FRAMEGEN_OPTIONS}
 
@@ -90,6 +111,7 @@ FRAMEGEN_ALIASES = {
 
 DEFAULT_SETTINGS = {
     "v4l2_loopback": False,
+    "ui_mode": "simple",
     "aspect_ratio": "auto",
     "osd_enabled": True,
     "osd_position": "tr",
@@ -105,6 +127,10 @@ DEFAULT_SETTINGS = {
     "minimize_to_tray": True,
     "duo_input": 0,
     "duo_edid_bridge": True,
+    "window_geometry": "",
+    "window_maximized": False,
+    "window_width": 1040,
+    "window_height": 680,
 }
 
 
@@ -121,6 +147,8 @@ def load_settings() -> dict:
 
     settings = dict(DEFAULT_SETTINGS)
     settings.update(data)
+    if settings.get("ui_mode") not in ("simple", "pro"):
+        settings["ui_mode"] = "simple"
     if not isinstance(settings.get("v4l2_loopback"), bool):
         settings["v4l2_loopback"] = False
     if not isinstance(settings.get("minimize_to_tray"), bool):
@@ -168,6 +196,10 @@ def load_settings() -> dict:
     # now advertises AC-3/DTS, so old settings migrate to the unified default.
     if settings.get("edid_profile") == "bitstream":
         settings["edid_profile"] = "default"
+    if not isinstance(settings.get("window_geometry"), str):
+        settings["window_geometry"] = ""
+    if not isinstance(settings.get("window_maximized"), bool):
+        settings["window_maximized"] = False
     return settings
 
 
@@ -480,12 +512,14 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QLabel, QPushButton, QComboBox, QCheckBox, QSlider, QFrame,
         QGroupBox, QMessageBox, QStackedLayout, QSizePolicy, QFileDialog,
-        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox
+        QSystemTrayIcon, QMenu, QDoubleSpinBox, QAbstractSpinBox, QScrollArea,
+        QColorDialog, QDialog, QLineEdit, QTextEdit, QSpinBox, QToolTip, QListView
     )
-    from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize
+    from PySide6.QtCore import Qt, QTimer, QThread, Signal, QEvent, QUrl, QSize, QRect, QPoint, QByteArray
     from PySide6.QtGui import (
         QGuiApplication, QFont, QIcon, QColor, QPalette, QKeySequence, QShortcut,
-        QDesktopServices, QPixmap, QPainter, QAction
+        QDesktopServices, QPixmap, QPainter, QAction, QImage, QPen, QBrush, QCursor,
+        QFontMetrics, QPainterPath
     )
     HAS_QT = True
 except ImportError:
@@ -694,12 +728,12 @@ LED_COLORS = {
     1: "#3b82f6",  # Blau (Standard)
     2: "#10b981",  # Grün
     3: "#ef4444",  # Rot
-    4: "#06b6d4",  # Cyan / Türkis
+    4: "#00ccff",  # Cyan / Türkis
     5: "#d946ef",  # Magenta / Lila
     6: "#eab308",  # Gelb
     7: "#f8fafc",  # Weiß
     8: "#a855f7",  # Rainbow Wave (Multi-Zone)
-    9: "#06b6d4",  # Spectrum Cycle
+    9: "#00ccff",  # Spectrum Cycle
 }
 
 # RGB values understood by everlive_userd --color.  Cyan matches the verified
@@ -753,7 +787,7 @@ def set_gc570d_led(mode: int) -> bool:
     return True
 
 
-def set_vfio_led(mode: int) -> bool:
+def set_vfio_led(mode: int, async_apply: bool = False) -> bool:
     """Apply an LED colour through everlive_userd (VFIO mode).
 
     everlive_userd owns BAR0 in standby.  A colour change therefore restarts
@@ -761,6 +795,11 @@ def set_vfio_led(mode: int) -> bool:
     BAR0 and drives the LED itself; in that case the choice is only persisted
     and restored after the streamer exits.
     """
+    if async_apply:
+        import threading
+        threading.Thread(target=set_vfio_led, args=(mode, False), daemon=True).start()
+        return True
+
     mode = int(mode)
     resolved = userd_bin("everlive_userd")
     if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
@@ -814,6 +853,67 @@ def create_led_icon(mode: int, size: int = 14):
     painter.drawEllipse(1, 1, size - 2, size - 2)
     painter.end()
     return QIcon(pix)
+
+
+def create_color_picker_icon(size: int = 18, color: str = "#ffffff") -> Optional["QIcon"]:
+    """Creates a crisp Photoshop/Material-style eyedropper tool icon."""
+    if not HAS_QT:
+        return None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+        svg_xml = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" fill="{color}">
+  <path d="M20.71 5.63l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-3.12 3.12-1.93-1.91-1.41 1.41 1.42 1.42L3 16.25V21h4.75l8.92-8.92 1.42 1.42 1.41-1.41-1.92-1.92 3.12-3.12c.4-.4.4-1.03.01-1.42zM6.92 19L5 17.08l8.06-8.06 1.92 1.92L6.92 19z"/>
+</svg>'''.encode("utf-8")
+        renderer = QSvgRenderer(svg_xml)
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pix)
+    except Exception:
+        pass
+
+    try:
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        s = size / 24.0
+        painter.scale(s, s)
+        path = QPainterPath()
+        path.moveTo(20.71, 5.63)
+        path.lineTo(18.37, 3.29)
+        path.quadTo(17.67, 2.59, 16.96, 3.29)
+        path.lineTo(13.84, 6.41)
+        path.lineTo(11.91, 4.5)
+        path.lineTo(10.5, 5.91)
+        path.lineTo(11.92, 7.33)
+        path.lineTo(3.0, 16.25)
+        path.lineTo(3.0, 21.0)
+        path.lineTo(7.75, 21.0)
+        path.lineTo(16.67, 12.08)
+        path.lineTo(18.09, 13.5)
+        path.lineTo(19.5, 12.09)
+        path.lineTo(17.58, 10.17)
+        path.lineTo(20.7, 7.05)
+        path.quadTo(21.1, 6.65, 20.71, 5.63)
+        path.closeSubpath()
+        hole = QPainterPath()
+        hole.moveTo(6.92, 19.0)
+        hole.lineTo(5.0, 17.08)
+        hole.lineTo(13.06, 9.02)
+        hole.lineTo(14.98, 10.94)
+        hole.closeSubpath()
+        path = path.subtracted(hole)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawPath(path)
+        painter.end()
+        return QIcon(pix)
+    except Exception:
+        return None
 
 
 def find_led_sysfs_path() -> Optional[str]:
@@ -945,7 +1045,7 @@ def _wpctl_everlive_stream_ids() -> list:
     ids = []
     try:
         out = subprocess.check_output(["wpctl", "status"], text=True,
-                                      stderr=subprocess.DEVNULL)
+                                      stderr=subprocess.DEVNULL, timeout=0.5)
     except Exception:
         return ids
 
@@ -970,7 +1070,8 @@ def _pactl_everlive_sink_ids() -> list:
     ids = []
     try:
         out = subprocess.check_output(["pactl", "list", "sink-inputs"],
-                                      text=True, stderr=subprocess.DEVNULL)
+                                      text=True, stderr=subprocess.DEVNULL,
+                                      timeout=0.5)
     except Exception:
         return ids
 
@@ -1163,7 +1264,10 @@ class GameStreamer:
             "hdr": previous.get("hdr", ""),
         }
         self._vfio_signal = info
-        self._vfio_live = not getattr(self, "_duo_no_signal", False)
+        if getattr(self, "_duo_no_signal", False):
+            self._vfio_live = False
+        else:
+            self._vfio_live = True
 
         if (previous.get("resolution") != resolution or
                 previous.get("framerate") != framerate or
@@ -1195,6 +1299,8 @@ class GameStreamer:
             r"\[VIDEO\] Capturing (\d+)x(\d+)([ip]) @ (\d+)\.(\d+) Hz "
             r"\([^,]+, ([^,]+), pclk", line)
         if m:
+            self._duo_no_signal = False
+            self._vfio_live = True
             self._update_vfio_signal(
                 int(m.group(1)), int(m.group(2)), m.group(3),
                 int(m.group(4)), int(m.group(5)),
@@ -1209,6 +1315,7 @@ class GameStreamer:
             fps = float(m.group(8))
             if fps > 0.5:
                 self._duo_no_signal = False
+                self._vfio_live = True
             self._update_vfio_signal(
                 int(m.group(1)), int(m.group(2)), m.group(3),
                 int(m.group(4)), int(m.group(5)))
@@ -1277,7 +1384,15 @@ class GameStreamer:
                 "Waiting for HDMI signal" in line):
             self._vfio_live = False
             return
+        m_duo = re.search(r"\[EVERLIVE DUO\] HDMI IN (\d) has no signal", line)
+        if m_duo:
+            port_num = int(m_duo.group(1)) - 1
+            if port_num == getattr(self, "duo_input", 0):
+                self._duo_no_signal = True
+                self._vfio_live = False
+            return
         if "EVERLIVE DUO" in line and "no signal" in line.lower():
+            # Generic fallback if port number wasn't found
             self._duo_no_signal = True
             self._vfio_live = False
 
@@ -1302,6 +1417,40 @@ class GameStreamer:
         self._read_vfio_log()
         sig = self._vfio_signal or {}
         live = bool(self.is_running and self._vfio_live and sig.get("resolution"))
+        if not live:
+            # Check shared memory directly if streamer log parsing is lagging
+            target_shm = SHM_GC573_NAME if (not self.duo_mode and os.path.exists(SHM_GC573_NAME)) else SHM_NAME
+            if os.path.exists(target_shm):
+                try:
+                    with open(target_shm, "rb") as f:
+                        buf = f.read(256)
+                    if len(buf) >= 64:
+                        magic = struct.unpack_from("<I", buf, 0)[0]
+                        if magic == SHM_MAGIC:
+                            if target_shm == SHM_GC573_NAME:
+                                port_off = 40
+                                w, h, ns, st = struct.unpack_from("<IIII", buf, port_off + 16)
+                            else:
+                                port = getattr(self, "duo_input", 0)
+                                port_off = SHM_HEADER_SIZE + port * SHM_PORT_SIZE
+                                if len(buf) >= port_off + 32:
+                                    w, h, ns, st = struct.unpack_from("<IIII", buf, port_off + 16)
+                                else:
+                                    w, h, ns, st = 0, 0, 1, 0
+                            if st != 0 and ns == 0 and w > 0 and h > 0:
+                                live = True
+                                self._duo_no_signal = False
+                                self._vfio_live = True
+                                sig = {
+                                    "resolution": f"{w}x{h}p",
+                                    "framerate": "60.00 FPS",
+                                    "chroma": sig.get("chroma") or "YUV 4:2:2",
+                                    "hdr": sig.get("hdr") or "SDR",
+                                }
+                                self._vfio_signal = sig
+                except Exception:
+                    pass
+
         has_cache = bool(sig.get("resolution") and
                          sig.get("resolution") != "No Signal")
 
@@ -1613,8 +1762,9 @@ class GameStreamer:
                         volume: float) -> bool:
         """Launch the GC570D (Live Gamer DUO) userspace engine."""
         if _vfio_streamer_running():
-            print("[!] A userspace streamer is already running; refusing to start a second instance.")
-            return False
+            print("[*] Userspace streamer is already active; attaching to live feed.")
+            self.is_running = True
+            return True
 
         if not (os.path.isfile(self.streamer_bin) and
                 os.access(self.streamer_bin, os.X_OK)):
@@ -1752,8 +1902,9 @@ class GameStreamer:
                 scale=scale, volume=volume)
 
         if _vfio_streamer_running():
-            print("[!] A userspace streamer is already running; refusing to start a second instance.")
-            return False
+            print("[*] Userspace streamer is already active; attaching to live feed.")
+            self.is_running = True
+            return True
 
         if not (os.path.isfile(self.streamer_bin) and
                 os.access(self.streamer_bin, os.X_OK)):
@@ -2181,10 +2332,1423 @@ class GameStreamer:
                 self.stop()
                 return False
             return True
+        elif self.vfio_mode and _vfio_streamer_running():
+            self._read_vfio_log()
+            return True
         return False
 
 
 if HAS_QT:
+    SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
+    SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
+    SHM_MAGIC = 0x47433537  # "GC57"
+    SHM_HEADER_SIZE = 40
+    SHM_PORT_HEADER_SIZE = 48
+    SHM_FRAME_BYTES = 1920 * 1080 * 2
+    SHM_SLOTS = 3
+    SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_SLOTS * SHM_FRAME_BYTES
+
+    # Base 256-byte CTA-861 EDID for custom modeline synthesis
+    BASE_GC573_EDID = bytes.fromhex(
+        "00ffffffffffff0006d8360000000000"
+        "101c010380a05a78ea08a5a2574fa228"
+        "0f5054250b00d1c08140818081008bc0"
+        "9500b3003b8008e80030f2705a80b058"
+        "8a006d552100001e0cdf80a070384040"
+        "30403500202f2100001e000000fc0041"
+        "56542047433537330a202020000000fd"
+        "0032f01ede3c000a2020202020200111"
+        "020344f15961605f5e5d101f5a3f0514"
+        "0413121103020122212016150706230f"
+        "0707834f000067030c001000383c67d8"
+        "5dc401788003e200cfe305c000e20f03"
+        "e30605016fc200a0a0a0555030203500"
+        "55502100001e9ee80078a0a067500820"
+        "980455502100001e565e00a0a0a02950"
+        "30203500555021000018000000000006"
+    )
+
+    def parse_modeline(line: str) -> dict:
+        """Parse an X11 / xrandr Modeline into its component timings and validate."""
+        text = line.strip()
+        if text.startswith("Modeline"):
+            text = text[8:].strip()
+
+        name = "custom"
+        m_name = re.match(r'^"([^"]+)"\s*(.*)', text)
+        if m_name:
+            name = m_name.group(1).strip()
+            text = m_name.group(2).strip()
+        else:
+            parts = text.split(None, 1)
+            if len(parts) == 2 and not re.match(r'^[0-9.]+$', parts[0]):
+                name = parts[0]
+                text = parts[1]
+
+        tokens = text.split()
+        if len(tokens) < 9:
+            raise ValueError("Modeline must contain at least 9 numeric timing values (Clock, 4 H, 4 V)")
+
+        pclk_mhz = float(tokens[0])
+        h_active = int(tokens[1])
+        h_sync_start = int(tokens[2])
+        h_sync_end = int(tokens[3])
+        h_total = int(tokens[4])
+
+        v_active = int(tokens[5])
+        v_sync_start = int(tokens[6])
+        v_sync_end = int(tokens[7])
+        v_total = int(tokens[8])
+
+        flags = [t.lower() for t in tokens[9:]]
+        interlaced = "interlace" in flags or "interlaced" in flags
+        hsync_pos = "+hsync" in flags or "-hsync" not in flags
+        vsync_pos = "+vsync" in flags or "-vsync" not in flags
+
+        if not (10.0 <= pclk_mhz <= 650.0):
+            raise ValueError(f"Pixel clock {pclk_mhz:.2f} MHz outside supported HDMI range (10 - 650 MHz)")
+        if not (320 <= h_active <= 4096):
+            raise ValueError(f"Horizontal active {h_active} out of range (320 - 4096)")
+        if not (200 <= v_active <= 2160):
+            raise ValueError(f"Vertical active {v_active} out of range (200 - 2160)")
+        if not (h_active < h_sync_start <= h_sync_end < h_total):
+            raise ValueError("Horizontal timings must satisfy: active < sync_start <= sync_end < total")
+        if not (v_active < v_sync_start <= v_sync_end < v_total):
+            raise ValueError("Vertical timings must satisfy: active < sync_start <= sync_end < total")
+
+        h_blank = h_total - h_active
+        v_blank = v_total - v_active
+        if h_blank > 4095 or v_blank > 4095:
+            raise ValueError("Blanking intervals exceed 12-bit EDID field limits")
+
+        h_sync_offset = h_sync_start - h_active
+        h_sync_width = h_sync_end - h_sync_start
+        v_sync_offset = v_sync_start - v_active
+        v_sync_width = v_sync_end - v_sync_start
+
+        if h_sync_offset > 1023 or h_sync_width > 1023:
+            raise ValueError("Horizontal sync pulse or offset exceeds 10-bit EDID limits")
+        if v_sync_offset > 63 or v_sync_width > 63:
+            raise ValueError("Vertical sync pulse or offset exceeds 6-bit EDID limits")
+
+        v_refresh = (pclk_mhz * 1e6) / (float(h_total) * float(v_total))
+
+        return {
+            "name": name,
+            "pclk_mhz": pclk_mhz,
+            "pclk_10khz": int(round(pclk_mhz * 100)),
+            "h_active": h_active,
+            "h_sync_start": h_sync_start,
+            "h_sync_end": h_sync_end,
+            "h_total": h_total,
+            "h_blank": h_blank,
+            "h_sync_offset": h_sync_offset,
+            "h_sync_width": h_sync_width,
+            "v_active": v_active,
+            "v_sync_start": v_sync_start,
+            "v_sync_end": v_sync_end,
+            "v_total": v_total,
+            "v_blank": v_blank,
+            "v_sync_offset": v_sync_offset,
+            "v_sync_width": v_sync_width,
+            "interlaced": interlaced,
+            "hsync_pos": hsync_pos,
+            "vsync_pos": vsync_pos,
+            "v_refresh": v_refresh,
+        }
+
+    def modeline_to_dtd(m: dict) -> bytes:
+        """Convert parsed modeline timing parameters into an 18-byte EDID Detailed Timing Descriptor."""
+        pclk = m["pclk_10khz"]
+        ha = m["h_active"]
+        hb = m["h_blank"]
+        va = m["v_active"]
+        vb = m["v_blank"]
+        hso = m["h_sync_offset"]
+        hsw = m["h_sync_width"]
+        vso = m["v_sync_offset"]
+        vsw = m["v_sync_width"]
+
+        b0 = pclk & 0xFF
+        b1 = (pclk >> 8) & 0xFF
+        b2 = ha & 0xFF
+        b3 = hb & 0xFF
+        b4 = (((ha >> 8) & 0x0F) << 4) | ((hb >> 8) & 0x0F)
+        b5 = va & 0xFF
+        b6 = vb & 0xFF
+        b7 = (((va >> 8) & 0x0F) << 4) | ((vb >> 8) & 0x0F)
+        b8 = hso & 0xFF
+        b9 = hsw & 0xFF
+        b10 = ((vso & 0x0F) << 4) | (vsw & 0x0F)
+        b11 = (((hso >> 8) & 0x03) << 6) | (((hsw >> 8) & 0x03) << 4) | (((vso >> 4) & 0x03) << 2) | ((vsw >> 4) & 0x03)
+        b12 = 0x58  # Horizontal size in mm (e.g. 600 mm)
+        b13 = 0x54  # Vertical size in mm (e.g. 340 mm)
+        b14 = ((0x02 & 0x0F) << 4) | (0x01 & 0x0F)
+        b15 = 0     # Border H
+        b16 = 0     # Border V
+
+        flags = 0x18  # Digital separate sync
+        if m["interlaced"]:
+            flags |= 0x80
+        if m["vsync_pos"]:
+            flags |= 0x04
+        if m["hsync_pos"]:
+            flags |= 0x02
+        b17 = flags
+
+        return bytes([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17])
+
+    def build_edid_from_modeline(m: dict, monitor_name: str = "") -> bytes:
+        """Synthesize a complete, valid 256-byte CTA-861 EDID with custom Detailed Timing Descriptor."""
+        edid = bytearray(BASE_GC573_EDID)
+        dtd = modeline_to_dtd(m)
+
+        # Place into Block 0 Detailed Timing Descriptor 1 (offset 54..71)
+        edid[54:72] = dtd
+
+        # Update Monitor Name Descriptor in Block 0 (offset 90..107)
+        name = (monitor_name or m["name"] or "Custom").strip()[:13]
+        name_bytes = name.encode("ascii", errors="replace")
+        desc_name = bytearray(b"\x00\x00\x00\xfc\x00" + name_bytes)
+        if len(desc_name) < 18:
+            desc_name.append(0x0A)
+            while len(desc_name) < 18:
+                desc_name.append(0x20)
+        edid[90:108] = desc_name[:18]
+
+        # Recalculate Block 0 checksum
+        edid[127] = (256 - (sum(edid[0:127]) % 256)) % 256
+
+        # Update Block 1 CTA-861 detailed timing slot
+        dtd_start = 128 + edid[130]
+        if dtd_start + 18 <= 255:
+            edid[dtd_start:dtd_start + 18] = dtd
+
+        # Recalculate Block 1 checksum
+        edid[255] = (256 - (sum(edid[128:255]) % 256)) % 256
+
+        return bytes(edid)
+
+    class CustomModelineDialog(QDialog):
+        """Import and validate X11 / xrandr Modeline to generate a custom EDID profile."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Import Custom Modeline (EDID Generator)")
+            self.resize(580, 440)
+            self.setStyleSheet("""
+                QDialog { background-color: #121620; color: #e6e9ef; }
+                QLabel { color: #d0d5e0; }
+                QTextEdit, QLineEdit {
+                    background-color: #1a202c;
+                    border: 1px solid #2d3748;
+                    border-radius: 6px;
+                    color: #ffffff;
+                    padding: 6px;
+                    font-family: monospace;
+                }
+                QPushButton {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                    border-radius: 6px;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #3b668e; }
+            """)
+
+            layout = QVBoxLayout(self)
+
+            lbl_desc = QLabel(
+                "Paste an X11 / xrandr Modeline (e.g. from <code>cvt</code>, <code>gtf</code>, or custom timings). "
+                "EverLive will parse and validate the timings, build an industry-standard 256-byte CTA-861 EDID, "
+                "and save it to <code>~/.config/everlive/edids/custom/</code>."
+            )
+            lbl_desc.setWordWrap(True)
+            layout.addWidget(lbl_desc)
+
+            layout.addWidget(QLabel("Modeline String:"))
+            self.txt_modeline = QTextEdit()
+            self.txt_modeline.setPlaceholderText(
+                'Modeline "1440x1080_120.00"  266.00  1440 1552 1704 1968  1080 1083 1088 1128 -hsync +vsync'
+            )
+            self.txt_modeline.setMaximumHeight(85)
+            self.txt_modeline.textChanged.connect(self._on_text_changed)
+            layout.addWidget(self.txt_modeline)
+
+            h_name = QHBoxLayout()
+            h_name.addWidget(QLabel("Profile / Output Name:"))
+            self.edit_name = QLineEdit("custom_timing")
+            self.edit_name.setFixedHeight(32)
+            h_name.addWidget(self.edit_name, 1)
+            layout.addLayout(h_name)
+
+            self.lbl_info = QLabel("Enter a valid modeline above to preview timings.")
+            self.lbl_info.setStyleSheet("color: #8a94a6; font-size: 11px;")
+            layout.addWidget(self.lbl_info)
+
+            self.chk_activate = QCheckBox("Set as active EDID profile immediately")
+            self.chk_activate.setChecked(True)
+            layout.addWidget(self.chk_activate)
+
+            layout.addStretch(1)
+
+            h_btns = QHBoxLayout()
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setFixedHeight(32)
+            self.btn_cancel.setStyleSheet("background-color: #2a303c;")
+            self.btn_cancel.clicked.connect(self.reject)
+            h_btns.addWidget(self.btn_cancel)
+
+            self.btn_import = QPushButton("Import & Generate EDID")
+            self.btn_import.setFixedHeight(32)
+            self.btn_import.setEnabled(False)
+            self.btn_import.clicked.connect(self._on_import)
+            h_btns.addWidget(self.btn_import)
+            layout.addLayout(h_btns)
+
+            self.generated_edid_path = ""
+            self.profile_name = ""
+            self._parsed = None
+
+        def _on_text_changed(self):
+            text = self.txt_modeline.toPlainText().strip()
+            if not text:
+                self.lbl_info.setText("Enter a valid modeline above to preview timings.")
+                self.lbl_info.setStyleSheet("color: #8a94a6; font-size: 11px;")
+                self.btn_import.setEnabled(False)
+                self._parsed = None
+                return
+
+            try:
+                m = parse_modeline(text)
+                self._parsed = m
+                msg = (
+                    f"✓ Valid: {m['h_active']}×{m['v_active']}{'i' if m['interlaced'] else 'p'} @ "
+                    f"{m['v_refresh']:.2f} Hz | Clock: {m['pclk_mhz']:.2f} MHz | "
+                    f"HTotal: {m['h_total']}, VTotal: {m['v_total']}"
+                )
+                self.lbl_info.setText(msg)
+                self.lbl_info.setStyleSheet("color: #4ade80; font-size: 11px; font-weight: bold;")
+                clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', m["name"]).strip('_')
+                if clean_name and (self.edit_name.text() in ("custom_timing", "", m["name"])):
+                    self.edit_name.setText(clean_name)
+                self.btn_import.setEnabled(True)
+            except Exception as e:
+                self._parsed = None
+                self.lbl_info.setText(f"✗ Timing error: {str(e)}")
+                self.lbl_info.setStyleSheet("color: #f87171; font-size: 11px;")
+                self.btn_import.setEnabled(False)
+
+        def _on_import(self):
+            if not self._parsed:
+                return
+            raw_name = self.edit_name.text().strip() or self._parsed["name"]
+            clean_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', raw_name).strip('_')
+            if not clean_name:
+                clean_name = "custom_timing"
+
+            dest_dir = os.path.expanduser("~/.config/everlive/edids/custom")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_file = os.path.join(dest_dir, f"{clean_name}.bin")
+
+            try:
+                edid_bytes = build_edid_from_modeline(self._parsed, clean_name)
+                with open(dest_file, "wb") as f:
+                    f.write(edid_bytes)
+                self.generated_edid_path = dest_file
+                self.profile_name = clean_name
+                self.accept()
+            except Exception as ex:
+                QMessageBox.critical(self, "EDID Generation Failed", f"Failed to save EDID: {ex}")
+
+    class ColorWheelWidget(QWidget):
+        """Interactive circular HSV color wheel with draggable reticle."""
+        colorChanged = Signal(QColor)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setFixedSize(200, 200)
+            self._hue = 180.0
+            self._sat = 1.0
+            self._val = 1.0
+            self._wheel_image = None
+            self._dragging = False
+            self._generate_wheel()
+
+        def _generate_wheel(self):
+            size = self.width()
+            img = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+            img.fill(Qt.transparent)
+            cx, cy = size / 2.0, size / 2.0
+            radius = (size / 2.0) - 6.0
+
+            for y in range(size):
+                dy = cy - y
+                for x in range(size):
+                    dx = x - cx
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist <= radius:
+                        angle = (math.atan2(dy, dx) * 180.0 / math.pi) % 360.0
+                        sat = min(1.0, dist / radius)
+                        c = QColor.fromHsvF(angle / 360.0, sat, self._val)
+                        img.setPixelColor(x, y, c)
+            self._wheel_image = img
+
+        def get_color(self) -> QColor:
+            return QColor.fromHsvF(self._hue / 360.0, self._sat, self._val)
+
+        def set_color(self, color: QColor):
+            h = color.hsvHueF()
+            if h < 0:
+                h = 0.0
+            self._hue = h * 360.0
+            self._sat = color.hsvSaturationF()
+            self._val = color.valueF()
+            self._generate_wheel()
+            self.update()
+
+        def set_value(self, val: float):
+            self._val = max(0.0, min(1.0, val))
+            self._generate_wheel()
+            self.update()
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            if self._wheel_image:
+                painter.drawImage(0, 0, self._wheel_image)
+
+            cx, cy = self.width() / 2.0, self.height() / 2.0
+            radius = (self.width() / 2.0) - 6.0
+            painter.setPen(QPen(QColor("#334155"), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPoint(int(cx), int(cy)), int(radius), int(radius))
+
+            rad = math.radians(self._hue)
+            dist = self._sat * radius
+            px = cx + dist * math.cos(rad)
+            py = cy - dist * math.sin(rad)
+
+            painter.setPen(QPen(QColor(15, 23, 42), 2))
+            painter.setBrush(Qt.white)
+            painter.drawEllipse(QPoint(int(px), int(py)), 6, 6)
+            painter.setPen(QPen(Qt.white, 1))
+            painter.drawEllipse(QPoint(int(px), int(py)), 4, 4)
+
+        def _handle_mouse(self, pos):
+            cx, cy = self.width() / 2.0, self.height() / 2.0
+            radius = (self.width() / 2.0) - 6.0
+            dx = pos.x() - cx
+            dy = cy - pos.y()
+            dist = math.sqrt(dx * dx + dy * dy)
+            self._hue = (math.atan2(dy, dx) * 180.0 / math.pi) % 360.0
+            self._sat = min(1.0, dist / radius)
+            self.update()
+            self.colorChanged.emit(self.get_color())
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.LeftButton:
+                self._dragging = True
+                self._handle_mouse(event.pos())
+
+        def mouseMoveEvent(self, event):
+            if self._dragging:
+                self._handle_mouse(event.pos())
+
+        def mouseReleaseEvent(self, event):
+            if event.button() == Qt.LeftButton:
+                self._dragging = False
+
+    class RgbColorPickerDialog(QDialog):
+        """Modern RGB LED color picker dialog featuring a circular color wheel and hardware presets."""
+        def __init__(self, initial_color=QColor("#00d8d8"), parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Select Card LED Color")
+            self.setFixedSize(460, 340)
+            self.setStyleSheet("""
+                QDialog {
+                    background-color: #0f131a;
+                    color: #e2e8f0;
+                    border: 1px solid #1f2537;
+                }
+                QLabel {
+                    color: #94a3b8;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+                QSpinBox, QLineEdit {
+                    background-color: #171b26;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3348;
+                    border-radius: 6px;
+                    padding: 4px 8px;
+                    font-size: 12px;
+                    min-height: 22px;
+                    max-height: 22px;
+                }
+                QSpinBox:focus, QLineEdit:focus {
+                    border-color: #3b82f6;
+                }
+                QPushButton#swatchPreset {
+                    min-width: 20px;
+                    max-width: 20px;
+                    min-height: 20px;
+                    max-height: 20px;
+                    border-radius: 4px;
+                    border: 1px solid #334155;
+                    padding: 0px;
+                }
+                QPushButton#swatchPreset:hover {
+                    border: 1px solid #ffffff;
+                }
+                QPushButton#btnDialogCancel {
+                    background-color: #1a2030;
+                    color: #cbd5e1;
+                    border: 1px solid #2a3448;
+                    border-radius: 6px;
+                    padding: 4px 14px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    min-height: 22px;
+                    max-height: 22px;
+                }
+                QPushButton#btnDialogCancel:hover {
+                    background-color: #242c40;
+                    border-color: #3b82f6;
+                    color: #ffffff;
+                }
+                QPushButton#btnDialogApply {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                    border: 1px solid #38658c;
+                    border-radius: 6px;
+                    padding: 4px 16px;
+                    font-size: 12px;
+                    font-weight: 600;
+                    min-height: 22px;
+                    max-height: 22px;
+                }
+                QPushButton#btnDialogApply:hover {
+                    background-color: #356085;
+                    border-color: #4a7fa8;
+                }
+            """)
+
+            self._color = QColor(initial_color) if isinstance(initial_color, (str, QColor)) else QColor("#00d8d8")
+            self._updating = False
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(20, 16, 20, 16)
+            root.setSpacing(12)
+
+            # Header title
+            lbl_head = QLabel("RGB LED COLOR SELECTOR")
+            lbl_head.setStyleSheet("color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: 0.8px;")
+            root.addWidget(lbl_head)
+
+            h_body = QHBoxLayout()
+            h_body.setSpacing(20)
+
+            # Left: Color Wheel + Brightness
+            v_wheel = QVBoxLayout()
+            v_wheel.setSpacing(8)
+            self.wheel = ColorWheelWidget()
+            self.wheel.setFixedSize(190, 190)
+            self.wheel.set_color(self._color)
+            self.wheel.colorChanged.connect(self._on_wheel_changed)
+            v_wheel.addWidget(self.wheel, 0, Qt.AlignCenter)
+
+            h_bright = QHBoxLayout()
+            h_bright.setSpacing(8)
+            lbl_br = QLabel("Brightness")
+            lbl_br.setStyleSheet("font-size: 10px; color: #64748b;")
+            h_bright.addWidget(lbl_br)
+            self.slider_bright = QSlider(Qt.Horizontal)
+            self.slider_bright.setRange(0, 100)
+            self.slider_bright.setValue(int(self._color.valueF() * 100))
+            self.slider_bright.valueChanged.connect(self._on_bright_changed)
+            h_bright.addWidget(self.slider_bright, 1)
+            v_wheel.addLayout(h_bright)
+            h_body.addLayout(v_wheel, 0)
+
+            # Right: Preview, RGB Sliders/Spinboxes, Hex, Presets
+            v_ctrl = QVBoxLayout()
+            v_ctrl.setSpacing(10)
+
+            # Swatch & Hex preview
+            h_prev = QHBoxLayout()
+            h_prev.setSpacing(10)
+            self.swatch = QFrame()
+            self.swatch.setFixedSize(48, 32)
+            self.swatch.setStyleSheet(f"background-color: {self._color.name()}; border: 1px solid #334155; border-radius: 4px;")
+            h_prev.addWidget(self.swatch)
+
+            self.edit_hex = QLineEdit(self._color.name().upper())
+            self.edit_hex.setFixedWidth(80)
+            self.edit_hex.setFixedHeight(32)
+            self.edit_hex.setAlignment(Qt.AlignCenter)
+            self.edit_hex.textChanged.connect(self._on_hex_edited)
+            h_prev.addWidget(self.edit_hex)
+            h_prev.addStretch(1)
+            v_ctrl.addLayout(h_prev)
+
+            # RGB Inputs
+            g_rgb = QGridLayout()
+            g_rgb.setHorizontalSpacing(8)
+            g_rgb.setVerticalSpacing(6)
+
+            for row, (label_text, spin_attr, getter) in enumerate([
+                ("R:", "spin_r", self._color.red()),
+                ("G:", "spin_g", self._color.green()),
+                ("B:", "spin_b", self._color.blue()),
+            ]):
+                lbl = QLabel(label_text)
+                lbl.setFixedWidth(16)
+                lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                spin = QSpinBox()
+                spin.setRange(0, 255)
+                spin.setValue(getter)
+                spin.setFixedWidth(80)
+                spin.setFixedHeight(32)
+                spin.valueChanged.connect(self._on_rgb_edited)
+                setattr(self, spin_attr, spin)
+                g_rgb.addWidget(lbl, row, 0)
+                g_rgb.addWidget(spin, row, 1)
+
+            g_rgb.setColumnStretch(2, 1)
+            v_ctrl.addLayout(g_rgb)
+
+            # Quick preset swatches
+            lbl_swatches = QLabel("PRESETS")
+            lbl_swatches.setStyleSheet("color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: 0.5px;")
+            v_ctrl.addWidget(lbl_swatches)
+
+            presets = ["#FF0000", "#00FF00", "#0000FF", "#00FFFF", "#FF00FF", "#FFFF00", "#FFFFFF", "#000000"]
+            h_swatches = QHBoxLayout()
+            h_swatches.setSpacing(6)
+            for p in presets:
+                btn_s = QPushButton()
+                btn_s.setObjectName("swatchPreset")
+                btn_s.setFixedSize(20, 20)
+                btn_s.setStyleSheet(f"background-color: {p};")
+                btn_s.setCursor(Qt.PointingHandCursor)
+                btn_s.clicked.connect(lambda _, col=p: self.set_color(QColor(col)))
+                h_swatches.addWidget(btn_s)
+            h_swatches.addStretch(1)
+            v_ctrl.addLayout(h_swatches)
+
+            v_ctrl.addStretch(1)
+            h_body.addLayout(v_ctrl, 1)
+            root.addLayout(h_body)
+
+            # Bottom buttons
+            h_btns = QHBoxLayout()
+            h_btns.setSpacing(10)
+            h_btns.addStretch(1)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setObjectName("btnDialogCancel")
+            btn_cancel.setFixedHeight(32)
+            btn_cancel.clicked.connect(self.reject)
+            h_btns.addWidget(btn_cancel)
+
+            btn_ok = QPushButton("Apply Color")
+            btn_ok.setObjectName("btnDialogApply")
+            btn_ok.setFixedHeight(32)
+            btn_ok.clicked.connect(self.accept)
+            h_btns.addWidget(btn_ok)
+            root.addLayout(h_btns)
+
+        def get_selected_color(self) -> QColor:
+            return self._color
+
+        def set_color(self, color: QColor):
+            self._color = color
+            self.wheel.set_color(color)
+            self.slider_bright.setValue(int(color.valueF() * 100))
+            self._sync_ui()
+
+        def _sync_ui(self):
+            self._updating = True
+            self.swatch.setStyleSheet(f"background-color: {self._color.name()}; border: 1px solid #334155; border-radius: 4px;")
+            self.edit_hex.setText(self._color.name().upper())
+            self.spin_r.setValue(self._color.red())
+            self.spin_g.setValue(self._color.green())
+            self.spin_b.setValue(self._color.blue())
+            self._updating = False
+
+        def _on_wheel_changed(self, color: QColor):
+            if self._updating:
+                return
+            self._color = color
+            self._sync_ui()
+
+        def _on_bright_changed(self, val: int):
+            if self._updating:
+                return
+            self.wheel.set_value(val / 100.0)
+            self._color = self.wheel.get_color()
+            self._sync_ui()
+
+        def _on_rgb_edited(self):
+            if self._updating:
+                return
+            self._color = QColor(self.spin_r.value(), self.spin_g.value(), self.spin_b.value())
+            self.wheel.set_color(self._color)
+            self.slider_bright.setValue(int(self._color.valueF() * 100))
+            self._sync_ui()
+
+        def _on_hex_edited(self, text: str):
+            if self._updating:
+                return
+            t = text.strip()
+            if not t.startswith("#"):
+                t = "#" + t
+            c = QColor(t)
+            if c.isValid():
+                self._color = c
+                self.wheel.set_color(c)
+                self.slider_bright.setValue(int(c.valueF() * 100))
+                self._updating = True
+                self.swatch.setStyleSheet(f"background-color: {c.name()}; border: 1px solid #334155; border-radius: 4px;")
+                self.spin_r.setValue(c.red())
+                self.spin_g.setValue(c.green())
+                self.spin_b.setValue(c.blue())
+                self._updating = False
+
+    class _Py_buffer(ctypes.Structure):
+        _fields_ = [
+            ("buf", ctypes.c_void_p),
+            ("obj", ctypes.c_void_p),
+            ("len", ctypes.c_ssize_t),
+            ("itemsize", ctypes.c_ssize_t),
+            ("readonly", ctypes.c_int),
+            ("ndim", ctypes.c_int),
+            ("format", ctypes.c_char_p),
+            ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+            ("internal", ctypes.c_void_p),
+        ]
+
+    def _get_buffer_addr(buf) -> int:
+        try:
+            pybuf = _Py_buffer()
+            if ctypes.pythonapi.PyObject_GetBuffer(ctypes.py_object(buf), ctypes.byref(pybuf), 0) == 0:
+                addr = pybuf.buf
+                ctypes.pythonapi.PyBuffer_Release(ctypes.byref(pybuf))
+                return addr or 0
+        except Exception:
+            pass
+        return 0
+
+    _lib_core = None
+    try:
+        _core_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "libeverlive-core", "libeverlive_core.so")
+        if os.path.isfile(_core_path):
+            _lib_core = ctypes.CDLL(_core_path)
+            _lib_core.everlive_yuy2_to_rgb.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            _lib_core.everlive_yuy2_to_rgb_scaled.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    except Exception:
+        _lib_core = None
+
+    class EmbeddedVideoCanvas(QWidget):
+        """Zero-latency embedded live video canvas for EverLive Console Hub.
+
+        Reads frames directly from userspace shared memory (/dev/shm/gc570d_v4l2_shm),
+        converts via SIMD-accelerated C or NumPy fixed-point, renders with aspect ratio
+        correction and letterboxing, and supports 1-click borderless fullscreen.
+        """
+        fullscreen_requested = Signal()
+        toggle_play_requested = Signal()
+        port_requested = Signal(int)
+
+        def __init__(self, parent=None, duo_mode: bool = False):
+            super().__init__(parent)
+            self.duo_mode = duo_mode
+            self.port = 0
+            self.aspect = "auto"
+            self.scale_mode = "fit"
+
+            self.is_streaming = False
+            self.has_signal = False
+            self.other_port_has_signal = None
+            self.current_width = 1920
+            self.current_height = 1080
+            self.signal_desc = "Standby"
+
+            self._current_qimage = None
+            self._rgb_buffer = None
+            self._last_seq = 0
+            self._shm_file = None
+            self._shm_mmap = None
+            self._is_gc573_shm = False
+            self._toast_message = ""
+            self._toast_start = 0.0
+            self._toast_duration = 3.0
+            self._prev_has_signal = False
+            self._hover_fs = False
+            self._mouse_in_canvas = False
+            self._fs_btn_rect = QRect()
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.timeout.connect(self._on_hover_timeout)
+
+            self.setMouseTracking(True)
+            self.setCursor(Qt.PointingHandCursor)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setMinimumHeight(240)
+            self.setMinimumWidth(426)
+            self.setStyleSheet("background-color: #080a10; border-radius: 8px;")
+
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.poll_frame)
+            self.timer.start(16)
+
+        def _on_hover_timeout(self):
+            if not getattr(self, "_hover_fs", False):
+                self._mouse_in_canvas = False
+                self.update()
+
+        def enterEvent(self, event):
+            super().enterEvent(event)
+            self._mouse_in_canvas = True
+            if hasattr(self, "_hover_timer"):
+                self._hover_timer.start(3000)
+            self.update()
+
+        def leaveEvent(self, event):
+            super().leaveEvent(event)
+            self._mouse_in_canvas = False
+            self._hover_fs = False
+            if hasattr(self, "_hover_timer"):
+                self._hover_timer.stop()
+            self.update()
+
+        def hasHeightForWidth(self) -> bool:
+            return False
+
+        def sizeHint(self) -> QSize:
+            return QSize(800, 450)
+
+        def minimumSizeHint(self) -> QSize:
+            return QSize(426, 240)
+
+        def set_port(self, port: int):
+            self.port = 1 if port == 1 else 0
+            self._last_seq = 0
+            self.update()
+
+        def set_aspect(self, aspect: str):
+            self.aspect = aspect or "auto"
+            self.update()
+
+        def set_scale_mode(self, scale: str):
+            self.scale_mode = scale or "fit"
+            self.update()
+
+        def show_toast(self, message: str, duration: float = 3.0):
+            """Show a semi-transparent floating OSD toast pill on the canvas."""
+            self._toast_message = str(message)
+            self._toast_start = time.monotonic()
+            self._toast_duration = max(0.5, float(duration))
+            self.update()
+
+        def poll_frame(self):
+            target_shm = SHM_GC573_NAME if (not self.duo_mode and os.path.exists(SHM_GC573_NAME)) else SHM_NAME
+            if self._shm_mmap is None:
+                if not os.path.exists(target_shm):
+                    if self.is_streaming:
+                        self.is_streaming = False
+                        self.has_signal = False
+                        self._current_qimage = None
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
+                        self.update()
+                    return
+                try:
+                    self._shm_file = open(target_shm, "rb")
+                    self._shm_mmap = mmap.mmap(
+                        self._shm_file.fileno(), 0, prot=mmap.PROT_READ)
+                    self._is_gc573_shm = (target_shm == SHM_GC573_NAME)
+                except Exception:
+                    self._shm_file = None
+                    self._shm_mmap = None
+                    return
+
+            try:
+                magic = struct.unpack_from("<I", self._shm_mmap, 0)[0]
+                if magic != SHM_MAGIC:
+                    return
+
+                if self._is_gc573_shm:
+                    port_off = 40
+                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                    if seq & 1 != 0:
+                        return
+                    if seq == self._last_seq and self._current_qimage is not None:
+                        return
+                    width, height, no_signal, streaming, fps_num, fps_den = struct.unpack_from(
+                        "<IIIIII", self._shm_mmap, port_off + 16)
+                    yuy2_off = port_off + 40
+                else:
+                    # In DUO mode, monitor the alternate port for active HDMI signal
+                    if self.duo_mode:
+                        other_port = 1 if self.port == 0 else 0
+                        other_off = SHM_HEADER_SIZE + other_port * SHM_PORT_SIZE
+                        other_w, other_h, other_ns, other_st = struct.unpack_from(
+                            "<IIII", self._shm_mmap, other_off + 16)
+                        if other_st != 0 and other_ns == 0 and other_w > 0:
+                            self.other_port_has_signal = other_port
+                        else:
+                            self.other_port_has_signal = None
+
+                    port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
+                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                    if seq == 0:
+                        return
+                    if seq == self._last_seq and self._current_qimage is not None:
+                        return
+
+                    width, height, no_signal, streaming = struct.unpack_from(
+                        "<IIII", self._shm_mmap, port_off + 16)
+                    ready_idx = struct.unpack_from("<I", self._shm_mmap, port_off + 36)[0]
+                    if ready_idx >= SHM_SLOTS:
+                        return
+                    yuy2_off = port_off + SHM_PORT_HEADER_SIZE + ready_idx * SHM_FRAME_BYTES
+
+                if streaming == 0:
+                    if self.is_streaming:
+                        self.is_streaming = False
+                        self.has_signal = False
+                        self._current_qimage = None
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
+                        self.update()
+                    return
+
+                self.is_streaming = True
+                if no_signal != 0 or width == 0 or height == 0:
+                    if self.has_signal or self._current_qimage is not None:
+                        self.has_signal = False
+                        self._current_qimage = None
+                        self.signal_desc = f"No HDMI Signal (Port {self.port + 1})" if self.duo_mode else "No HDMI Signal"
+                        if self._prev_has_signal:
+                            self._prev_has_signal = False
+                            self.show_toast("HDMI Signal: Disconnected")
+                        self.update()
+                    return
+
+                self.has_signal = True
+                self.current_width = width
+                self.current_height = height
+                self.signal_desc = f"{width}×{height} @ 60 Hz"
+                if not self._prev_has_signal:
+                    self._prev_has_signal = True
+                    self.show_toast(f"HDMI Signal: {self.signal_desc} (Locked)")
+
+                payload_len = width * height * 2
+                yuy2_slice = memoryview(self._shm_mmap)[yuy2_off : yuy2_off + payload_len]
+
+                post_seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
+                if post_seq != seq:
+                    return
+
+
+                rgb_len = width * height * 3
+                if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_len:
+                    self._rgb_buffer = bytearray(rgb_len)
+
+                yuy2_addr = _get_buffer_addr(yuy2_slice)
+                dst_addr = _get_buffer_addr(self._rgb_buffer)
+
+                if _lib_core is not None and yuy2_addr and dst_addr:
+                    _lib_core.everlive_yuy2_to_rgb(yuy2_addr, dst_addr, width, height)
+                    qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
+                elif HAS_NUMPY:
+                    raw = np.frombuffer(yuy2_slice, dtype=np.uint8).reshape((height, width, 2))
+                    y = raw[:, :, 0].astype(np.int32)
+                    u = np.repeat(raw[:, 0::2, 1], 2, axis=1).astype(np.int32) - 128
+                    v = np.repeat(raw[:, 1::2, 1], 2, axis=1).astype(np.int32) - 128
+                    r = np.clip(y + ((359 * v) >> 8), 0, 255).astype(np.uint8)
+                    g = np.clip(y - ((88 * u + 183 * v) >> 8), 0, 255).astype(np.uint8)
+                    b = np.clip(y + ((454 * u) >> 8), 0, 255).astype(np.uint8)
+                    rgb_arr = np.ascontiguousarray(np.dstack((r, g, b)))
+                    qimg = QImage(rgb_arr.data, width, height, width * 3, QImage.Format_RGB888).copy()
+                elif _lib_core is not None and dst_addr:
+                    src_copy = bytearray(yuy2_slice)
+                    src_addr = _get_buffer_addr(src_copy)
+                    if src_addr:
+                        _lib_core.everlive_yuy2_to_rgb(src_addr, dst_addr, width, height)
+                        qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
+                    else:
+                        return
+                else:
+                    return
+
+                self._last_seq = seq
+                self._current_qimage = qimg
+                self.update()
+            except Exception as e:
+                if not getattr(self, "_logged_poll_err", False):
+                    print(f"[EmbeddedVideoCanvas] poll_frame error: {e}")
+                    self._logged_poll_err = True
+                if self._shm_mmap:
+                    try: self._shm_mmap.close()
+                    except Exception: pass
+                    self._shm_mmap = None
+                if self._shm_file:
+                    try: self._shm_file.close()
+                    except Exception: pass
+                    self._shm_file = None
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            w = self.width()
+            h = self.height()
+            # Canvas letterbox / background
+            painter.fillRect(0, 0, w, h, QColor("#0b0d13"))
+
+            # Calculate strict 16:9 embed geometry
+            embed_aspect = 16.0 / 9.0
+            viewport_aspect = float(w) / float(h if h > 0 else 1)
+            if viewport_aspect > embed_aspect:
+                embed_h = h
+                embed_w = int(round(embed_h * embed_aspect))
+                embed_x = (w - embed_w) // 2
+                embed_y = 0
+            else:
+                embed_w = w
+                embed_h = int(round(embed_w / embed_aspect))
+                embed_x = 0
+                embed_y = (h - embed_h) // 2
+            embed_rect = QRect(embed_x, embed_y, embed_w, embed_h)
+
+            # Draw 16:9 enclosure screen
+            painter.fillRect(embed_rect, QColor("#080a10"))
+            painter.setPen(QPen(QColor("#182030"), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(embed_rect.adjusted(0, 0, -1, -1), 8, 8)
+
+            if (self._current_qimage and not self._current_qimage.isNull() and
+                    self.is_streaming and self.has_signal):
+                img_w = self._current_qimage.width()
+                img_h = self._current_qimage.height()
+
+                # Determine target aspect ratio
+                if self.aspect == "4:3":
+                    target_ratio = 4.0 / 3.0
+                elif self.aspect == "16:9" or self.aspect == "stretch":
+                    target_ratio = 16.0 / 9.0
+                else:  # auto
+                    if img_h > 0 and (abs(float(img_w) / img_h - 4.0 / 3.0) < 0.08 or
+                                      (img_w in (640, 720) and img_h in (480, 576))):
+                        target_ratio = 4.0 / 3.0
+                    else:
+                        target_ratio = 16.0 / 9.0
+
+                if self.scale_mode == "integer":
+                    mult = max(1, min(embed_w // img_w, embed_h // img_h)) if (img_w > 0 and img_h > 0) else 1
+                    dw = img_w * mult
+                    dh = img_h * mult
+                    dx = embed_x + (embed_w - dw) // 2
+                    dy = embed_y + (embed_h - dh) // 2
+                    target_rect = QRect(dx, dy, dw, dh)
+                else:
+                    if abs(target_ratio - (4.0 / 3.0)) < 0.01:
+                        # 4:3 content displayed centered inside 16:9 embed with symmetric pillarboxing
+                        dh = embed_h
+                        dw = int(round(dh * (4.0 / 3.0)))
+                        dx = embed_x + (embed_w - dw) // 2
+                        dy = embed_y
+                        target_rect = QRect(dx, dy, dw, dh)
+                    else:
+                        # 16:9 fills the embed exactly
+                        target_rect = embed_rect
+
+                painter.drawImage(target_rect, self._current_qimage)
+
+            else:
+                # Standby / No signal screen inside 16:9 embed
+                painter.setPen(QColor("#5c6880"))
+                painter.setFont(QFont("sans-serif", 32))
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 - 68, embed_w, 48), Qt.AlignCenter, "🎮")
+
+                if self.is_streaming and not self.has_signal:
+                    if self.other_port_has_signal is not None:
+                        title = f"No Signal on HDMI {self.port + 1} · HDMI {self.other_port_has_signal + 1} Active"
+                        subtitle = f"Active feed on HDMI {self.other_port_has_signal + 1} — Click here to switch"
+                    else:
+                        title = f"No HDMI Signal on HDMI {self.port + 1}" if self.duo_mode else "No HDMI Signal"
+                        subtitle = "Power on console or connect HDMI source to display feed"
+                else:
+                    title = "EverLive Live Console Display"
+                    subtitle = "Waiting for HDMI input signal..."
+
+                painter.setPen(QColor("#e6e9ef"))
+                painter.setFont(QFont("sans-serif", 13, QFont.Bold))
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 - 14, embed_w, 24), Qt.AlignCenter, title)
+
+                painter.setPen(QColor("#8a94a6" if self.other_port_has_signal is None else "#7fd1ad"))
+                painter.setFont(QFont("sans-serif", 10, QFont.Bold if self.other_port_has_signal is not None else QFont.Normal))
+                painter.drawText(QRect(embed_x, embed_y + embed_h // 2 + 14, embed_w, 20), Qt.AlignCenter, subtitle)
+
+            # Top-right hover button inside 16:9 embed - only show on hover
+            btn_w, btn_h = 135, 28
+            btn_x = embed_x + embed_w - btn_w - 14
+            btn_y = embed_y + 12
+            self._fs_btn_rect = QRect(btn_x, btn_y, btn_w, btn_h)
+
+            if getattr(self, "_mouse_in_canvas", False) or getattr(self, "_hover_fs", False):
+                btn_bg = QColor(43, 79, 110, 230) if self._hover_fs else QColor(26, 32, 48, 195)
+                btn_border = QColor(70, 88, 122) if self._hover_fs else QColor(42, 50, 66)
+                painter.setPen(QPen(btn_border, 1))
+                painter.setBrush(btn_bg)
+                painter.drawRoundedRect(self._fs_btn_rect, 6, 6)
+
+                painter.setPen(QColor("#ffffff" if self._hover_fs else "#d7dde8"))
+                painter.setFont(QFont("sans-serif", 9, QFont.Bold))
+                painter.drawText(self._fs_btn_rect, Qt.AlignCenter, "⛶ Fullscreen (F)")
+
+            # Floating toast notification pill inside 16:9 embed (bottom-center)
+            if self._toast_message:
+                elapsed = time.monotonic() - self._toast_start
+                if elapsed < self._toast_duration:
+                    if elapsed < 0.25:
+                        alpha = int((elapsed / 0.25) * 235)
+                    elif elapsed > self._toast_duration - 0.35:
+                        alpha = int(((self._toast_duration - elapsed) / 0.35) * 235)
+                    else:
+                        alpha = 235
+                    alpha = max(0, min(235, alpha))
+
+                    font = QFont("sans-serif", 10, QFont.Bold)
+                    fm = QFontMetrics(font)
+                    text_w = fm.horizontalAdvance(self._toast_message)
+                    pill_w = text_w + 36
+                    pill_h = 32
+                    pill_x = embed_x + (embed_w - pill_w) // 2
+                    pill_y = embed_y + embed_h - pill_h - 20
+                    pill_rect = QRect(pill_x, pill_y, pill_w, pill_h)
+
+                    painter.setPen(QPen(QColor(64, 160, 255, alpha), 1))
+                    painter.setBrush(QColor(14, 20, 32, alpha))
+                    painter.drawRoundedRect(pill_rect, 16, 16)
+
+                    painter.setPen(QColor(240, 245, 255, alpha))
+                    painter.setFont(font)
+                    painter.drawText(pill_rect, Qt.AlignCenter, self._toast_message)
+
+        def mouseMoveEvent(self, event):
+            super().mouseMoveEvent(event)
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self._mouse_in_canvas = True
+            if hasattr(self, "_hover_timer"):
+                self._hover_timer.start(3000)
+            hover = self._fs_btn_rect.contains(pos)
+            if hover != self._hover_fs:
+                self._hover_fs = hover
+                self.update()
+
+        def mousePressEvent(self, event):
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            fs_active = getattr(self, "_mouse_in_canvas", False) or getattr(self, "_hover_fs", False)
+            if fs_active and self._fs_btn_rect.contains(pos):
+                self.fullscreen_requested.emit()
+            elif self.is_streaming and not self.has_signal and self.other_port_has_signal is not None:
+                self.set_port(self.other_port_has_signal)
+                self.port_requested.emit(self.other_port_has_signal)
+            elif not self.is_streaming:
+                self.toggle_play_requested.emit()
+
+        def mouseDoubleClickEvent(self, event):
+            self.fullscreen_requested.emit()
+
+    class FullscreenVideoWindow(QWidget):
+        """Borderless edge-to-edge fullscreen presentation window with unified top HUD overlay."""
+        def __init__(self, canvas: EmbeddedVideoCanvas, main_window):
+            super().__init__()
+            self.canvas = canvas
+            self.main_window = main_window
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+            self.setStyleSheet("background-color: #000000;")
+            self.setWindowTitle("EverLive Fullscreen")
+            self.setFocusPolicy(Qt.StrongFocus)
+            self.setMouseTracking(True)
+
+            self.cursor_timer = QTimer(self)
+            self.cursor_timer.setSingleShot(True)
+            self.cursor_timer.timeout.connect(self._on_cursor_timeout)
+
+            self.osd_visible = True
+            self.osd_user_hidden = False
+
+            # Unified Top floating telemetry & controls overlay HUD
+            self.osd_hud = QFrame(self)
+            self.osd_hud.setFocusPolicy(Qt.NoFocus)
+            self.osd_hud.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(14, 19, 29, 235);
+                    border: 1px solid #2a3448;
+                    border-radius: 10px;
+                }
+            """)
+            v_hud = QVBoxLayout(self.osd_hud)
+            v_hud.setContentsMargins(16, 8, 16, 8)
+            v_hud.setSpacing(5)
+
+            h_hud_top = QHBoxLayout()
+            h_hud_top.setSpacing(10)
+
+            self.lbl_hud_title = QLabel("EverLive Capture")
+            self.lbl_hud_title.setStyleSheet(
+                "color: #ffffff; font-weight: bold; font-size: 13px; border: none; background: transparent;")
+            h_hud_top.addWidget(self.lbl_hud_title)
+
+            self.lbl_hud_port = QLabel("● HDMI Live")
+            self.lbl_hud_port.setStyleSheet("""
+                background-color: rgba(13, 35, 24, 220);
+                color: #34d399;
+                border: 1px solid #164e32;
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-size: 10px;
+                font-weight: bold;
+            """)
+            h_hud_top.addWidget(self.lbl_hud_port)
+
+            h_hud_top.addStretch(1)
+
+
+            # Migrated action buttons directly in the top HUD
+            self.btn_aspect = QPushButton("Aspect: AUTO (A)")
+            self.btn_aspect.setFocusPolicy(Qt.NoFocus)
+            self.btn_aspect.setCursor(Qt.PointingHandCursor)
+            self.btn_aspect.setStyleSheet(
+                "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.btn_aspect.clicked.connect(self._cycle_aspect)
+            h_hud_top.addWidget(self.btn_aspect)
+
+            self.btn_toggle_osd = QPushButton("Hide OSD (Tab)")
+            self.btn_toggle_osd.setFocusPolicy(Qt.NoFocus)
+            self.btn_toggle_osd.setCursor(Qt.PointingHandCursor)
+            self.btn_toggle_osd.setStyleSheet(
+                "background: #1a2030; color: #8a94a6; border: 1px solid #2a3448; padding: 3px 9px; border-radius: 4px; font-size: 11px;")
+            self.btn_toggle_osd.clicked.connect(self.toggle_osd)
+            h_hud_top.addWidget(self.btn_toggle_osd)
+
+            btn_exit = QPushButton("✕ Exit (Esc)")
+            btn_exit.setFocusPolicy(Qt.NoFocus)
+            btn_exit.setCursor(Qt.PointingHandCursor)
+            btn_exit.setStyleSheet(
+                "background: #2b4f6e; color: #ffffff; border: 1px solid #38658c; padding: 3px 11px; font-weight: bold; font-size: 11px; border-radius: 4px;")
+            btn_exit.clicked.connect(self.close)
+            h_hud_top.addWidget(btn_exit)
+
+            v_hud.addLayout(h_hud_top)
+
+            self.lbl_hud_meta = QLabel("Checking HDMI Signal...")
+            self.lbl_hud_meta.setStyleSheet(
+                "color: #7fd1ad; font-weight: bold; font-size: 11px; border: none; background: transparent;")
+            v_hud.addWidget(self.lbl_hud_meta)
+
+            self._hud_tick = 0
+            self.rep_timer = QTimer(self)
+            self.rep_timer.timeout.connect(self._on_render_tick)
+            self.rep_timer.start(16)
+
+        def _on_render_tick(self):
+            self._hud_tick += 1
+            if self._hud_tick % 30 == 0 and self.osd_visible:
+                self._update_hud_telemetry()
+            self.update()
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            self.setFocus()
+            self._sync_controls_state()
+            self._show_osd(user_initiated=False)
+
+        def _sync_controls_state(self):
+            pass
+
+        def _update_hud_telemetry(self):
+            self._sync_controls_state()
+            card_name = getattr(self.main_window, "card_display_name", "EverLive Video Feed")
+            if hasattr(self, "lbl_hud_title"):
+                self.lbl_hud_title.setText(card_name)
+
+            if hasattr(self, "lbl_hud_port"):
+                if getattr(self.main_window, "duo_mode", False):
+                    port_idx = getattr(self.canvas, "port", 0)
+                    self.lbl_hud_port.setText(f"● HDMI {port_idx + 1}")
+                else:
+                    self.lbl_hud_port.setText("● HDMI Live")
+
+            meta_text = ""
+            if hasattr(self.main_window, "_format_signal_subtitle"):
+                try:
+                    meta_text = self.main_window._format_signal_subtitle()
+                except Exception:
+                    meta_text = ""
+            if not meta_text:
+                if self.canvas.has_signal:
+                    meta_text = f"{self.canvas.current_width}×{self.canvas.current_height} • 60 FPS • SDR • Audio Active"
+                else:
+                    meta_text = "No HDMI Signal • Waiting for input"
+
+            aspect = getattr(self.canvas, "aspect", "auto").upper()
+            full_meta = f"{meta_text}   •   Aspect: {aspect}"
+            if hasattr(self, "lbl_hud_meta"):
+                self.lbl_hud_meta.setText(full_meta)
+
+            if hasattr(self, "btn_aspect"):
+                self.btn_aspect.setText(f"Aspect: {aspect} (A)")
+
+        def _cycle_aspect(self):
+            order = ["auto", "16:9", "4:3", "stretch"]
+            cur = getattr(self.canvas, "aspect", "auto")
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else "auto"
+            self.canvas.set_aspect(nxt)
+            if hasattr(self.main_window, "combo_aspect"):
+                idx = self.main_window.combo_aspect.findData(nxt)
+                if idx >= 0:
+                    self.main_window.combo_aspect.blockSignals(True)
+                    self.main_window.combo_aspect.setCurrentIndex(idx)
+                    self.main_window.combo_aspect.blockSignals(False)
+            self._update_hud_telemetry()
+            self.update()
+
+        def _on_cursor_timeout(self):
+            if not getattr(self, "osd_user_hidden", False):
+                self._hide_osd(user_initiated=False)
+            else:
+                self.setCursor(Qt.BlankCursor)
+
+        def _hide_osd(self, user_initiated: bool = False):
+            self.osd_visible = False
+            if user_initiated:
+                self.osd_user_hidden = True
+            if hasattr(self, "osd_hud"):
+                self.osd_hud.setVisible(False)
+            self.setCursor(Qt.BlankCursor)
+
+        def _show_osd(self, user_initiated: bool = False):
+            self.osd_visible = True
+            if user_initiated:
+                self.osd_user_hidden = False
+            self._update_hud_telemetry()
+            if hasattr(self, "osd_hud"):
+                self.osd_hud.setVisible(True)
+            self.unsetCursor()
+            self.cursor_timer.start(3500)
+
+        def toggle_osd(self):
+            if self.osd_visible:
+                self._hide_osd(user_initiated=True)
+            else:
+                self._show_osd(user_initiated=True)
+
+        def mouseMoveEvent(self, event):
+            if getattr(self, "osd_user_hidden", False):
+                self.unsetCursor()
+                self.cursor_timer.start(2000)
+                return
+            if not self.osd_visible:
+                self._show_osd(user_initiated=False)
+            else:
+                self.cursor_timer.start(3500)
+
+        def event(self, e):
+            if e.type() == QEvent.KeyPress and e.key() == Qt.Key_Tab:
+                self.toggle_osd()
+                return True
+            return super().event(e)
+
+        def keyPressEvent(self, event):
+            key = event.key()
+            if key in (Qt.Key_Escape, Qt.Key_F, Qt.Key_F11, Qt.Key_Q):
+                self.close()
+                event.accept()
+            elif key in (Qt.Key_Tab, Qt.Key_O, Qt.Key_F1, Qt.Key_I):
+                self.toggle_osd()
+                event.accept()
+            elif key == Qt.Key_A:
+                self._cycle_aspect()
+                event.accept()
+            else:
+                super().keyPressEvent(event)
+
+        def mouseDoubleClickEvent(self, event):
+            self.close()
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            w = self.width()
+            h = self.height()
+            hint = self.osd_hud.sizeHint()
+            hud_w = min(max(920, hint.width() + 24), w - 40)
+            hud_h = max(66, hint.height() + 8)
+            self.osd_hud.setGeometry((w - hud_w) // 2, 20, hud_w, hud_h)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+            w = self.width()
+            h = self.height()
+            painter.fillRect(0, 0, w, h, Qt.black)
+
+            qimg = self.canvas._current_qimage
+            if (qimg and not qimg.isNull() and
+                    self.canvas.is_streaming and self.canvas.has_signal):
+                img_w = qimg.width()
+                img_h = qimg.height()
+                aspect = getattr(self.canvas, "aspect", "auto")
+                scale_mode = getattr(self.canvas, "scale_mode", "fit")
+
+                if aspect == "4:3":
+                    target_ratio = 4.0 / 3.0
+                elif aspect == "16:9":
+                    target_ratio = 16.0 / 9.0
+                elif aspect == "stretch":
+                    target_ratio = float(w) / float(h if h > 0 else 1)
+                else:
+                    target_ratio = float(img_w) / float(img_h if img_h > 0 else 1)
+
+                canvas_ratio = float(w) / float(h if h > 0 else 1)
+                if scale_mode == "integer":
+                    mult = max(1, min(w // img_w, h // img_h)) if (img_w > 0 and img_h > 0) else 1
+                    dw = img_w * mult
+                    dh = img_h * mult
+                    dx = (w - dw) // 2
+                    dy = (h - dh) // 2
+                else:
+                    if canvas_ratio > target_ratio:
+                        dh = h
+                        dw = int(dh * target_ratio)
+                        dx = (w - dw) // 2
+                        dy = 0
+                    else:
+                        dw = w
+                        dh = int(dw / target_ratio)
+                        dx = 0
+                        dy = (h - dh) // 2
+                painter.drawImage(QRect(dx, dy, dw, dh), qimg)
+            else:
+                painter.setPen(QColor("#7fd1ad"))
+                painter.setFont(QFont("sans-serif", 16, QFont.Bold))
+                painter.drawText(
+                    QRect(0, 0, w, h), Qt.AlignCenter, "Waiting for HDMI Stream...")
+
     class MainWindow(QMainWindow):
         def __init__(self, streamer: GameStreamer, vsync: bool = True, streamer_mode: bool = False,
                      headless_start: bool = False, v4l2_device: Optional[str] = None):
@@ -2196,6 +3760,7 @@ if HAS_QT:
             self.enable_vsync = vsync
             self.muted = False
             self.saved_cfg = load_settings()
+            self.is_advanced_mode = (self.saved_cfg.get("ui_mode") in ("advanced", "pro"))
             self._headless_start = headless_start
             self._v4l2_device = v4l2_device
             # Remote control: set once we attach to a streamer we did not
@@ -2217,7 +3782,11 @@ if HAS_QT:
             if not self.vfio_mode and self.saved_cfg.get("engine", "native") == "mpv":
                 self.streamer.force_mpv = True
 
+
+            self._fullscreen_window = None
             self.init_ui()
+            QShortcut(QKeySequence("F"), self, self.toggle_fullscreen)
+            QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
 
             if v4l2_device:
                 self.chk_v4l2.setChecked(True)
@@ -2248,18 +3817,81 @@ if HAS_QT:
             self._ipc_timer.setInterval(1000)
             self._ipc_timer.timeout.connect(self._poll_remote_status)
 
-            # Check if autostart or headless start is requested
-            if headless_start:
-                QTimer.singleShot(250, self.start_studio)
-            elif self.saved_cfg.get("autostart", False) or getattr(streamer, "_cli_autostart", False):
-                QTimer.singleShot(250, self.start_gaming_screen)
+            # Auto-attach to already running capture engine or start automatically on launch
+            if _vfio_streamer_running():
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                print("[*] Userspace capture engine already active; attaching live feed.")
+            elif headless_start:
+                QTimer.singleShot(150, self.start_studio)
+            elif self.saved_cfg.get("autostart", True) or getattr(streamer, "_cli_autostart", False):
+                QTimer.singleShot(150, lambda: self.start_gaming_screen(detached=False))
 
             QTimer.singleShot(300, self, self._ipc_try_attach)
 
+        def _style_combobox(self, cb: QComboBox):
+            """Applies consistent 32px height, combobox-popup:0, and solid opaque popup list view."""
+            cb.setFixedHeight(32)
+            view = QListView(cb)
+            view.setStyleSheet("""
+                QListView {
+                    background-color: #151a24;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3548;
+                    border-radius: 6px;
+                    outline: none;
+                    padding: 4px;
+                }
+                QListView::item {
+                    min-height: 28px;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                    color: #e6e9ef;
+                }
+                QListView::item:hover {
+                    background-color: #212a3a;
+                    color: #ffffff;
+                }
+                QListView::item:selected {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                }
+            """)
+            cb.setView(view)
+
         def init_ui(self):
+            if QApplication.instance():
+                QApplication.instance().setStyle("Fusion")
+                pal = QApplication.palette()
+                pal.setColor(QPalette.ToolTipBase, QColor("#151a24"))
+                pal.setColor(QPalette.ToolTipText, QColor("#f1f5f9"))
+                QApplication.setPalette(pal)
+                QToolTip.setPalette(pal)
+
             self.setWindowTitle("EverLive - Console Hub")
-            # Compact console-hub layout: sized so cards never squash
-            self.setFixedWidth(920)
+            self.setMinimumSize(840, 500)
+
+            # Restore user window geometry and size
+            saved_cfg = load_settings()
+            saved_geo = saved_cfg.get("window_geometry")
+            restored = False
+            if saved_geo and isinstance(saved_geo, str) and len(saved_geo) > 10:
+                try:
+                    restored = self.restoreGeometry(QByteArray.fromHex(saved_geo.encode("ascii")))
+                except Exception:
+                    restored = False
+            if not restored:
+                w = saved_cfg.get("window_width")
+                h = saved_cfg.get("window_height")
+                if isinstance(w, int) and isinstance(h, int) and w >= 840 and h >= 500:
+                    self.resize(w, h)
+                else:
+                    default_w = 1040
+                    default_h = 880 if self.is_advanced_mode else 680
+                    self.resize(default_w, default_h)
+            if saved_cfg.get("window_maximized", False):
+                self.showMaximized()
 
             # Application & Window Icon
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "everlive.png")
@@ -2614,12 +4246,84 @@ if HAS_QT:
                 QLabel#footerText { color: #5f6878; font-size: 11px; }
 
                 QComboBox {
-                    min-height: 24px;
+                    combobox-popup: 0;
+                    min-height: 22px;
+                    max-height: 22px;
                     padding: 4px 10px;
                     font-size: 12px;
+                    background-color: #171b26;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3348;
+                    border-radius: 6px;
                 }
-                QDoubleSpinBox {
-                    min-height: 24px;
+                QComboBox:hover {
+                    border-color: #3b82f6;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    width: 22px;
+                }
+                QComboBox QAbstractItemView, QComboBox QListView {
+                    background-color: #151a24;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3548;
+                    border-radius: 6px;
+                    selection-background-color: #2b4f6e;
+                    selection-color: #ffffff;
+                    outline: none;
+                    padding: 4px;
+                }
+                QComboBox QAbstractItemView::item, QComboBox QListView::item {
+                    min-height: 28px;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                    color: #e6e9ef;
+                    background-color: transparent;
+                }
+                QComboBox QAbstractItemView::item:hover, QComboBox QListView::item:hover {
+                    background-color: #212a3a;
+                    color: #ffffff;
+                }
+                QComboBox QAbstractItemView::item:selected, QComboBox QListView::item:selected {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                }
+
+                QToolTip {
+                    background-color: #151a24;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3548;
+                    border-radius: 5px;
+                    padding: 5px 8px;
+                    font-size: 11px;
+                    opacity: 255;
+                }
+
+                QMenu {
+                    background-color: #151a24;
+                    color: #f1f5f9;
+                    border: 1px solid #2b3548;
+                    border-radius: 6px;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    padding: 6px 14px;
+                    border-radius: 4px;
+                    color: #e6e9ef;
+                }
+                QMenu::item:selected {
+                    background-color: #2b4f6e;
+                    color: #ffffff;
+                }
+                QMenu::separator {
+                    height: 1px;
+                    background-color: #232a37;
+                    margin: 4px 8px;
+                }
+
+                QLineEdit, QSpinBox, QDoubleSpinBox {
+                    min-height: 22px;
+                    max-height: 22px;
                     padding: 4px 10px;
                     font-size: 12px;
                     background-color: #171d29;
@@ -2627,15 +4331,15 @@ if HAS_QT:
                     border: 1px solid #2a3242;
                     border-radius: 6px;
                 }
+                QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #3a465e; }
+                QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #4b6ea8; }
                 QDoubleSpinBox QLineEdit {
-                    padding-left: 10px;
-                    padding-right: 10px;
+                    padding-left: 6px;
+                    padding-right: 6px;
                     background: transparent;
                     color: #e6e9ef;
                     border: none;
                 }
-                QDoubleSpinBox:hover { border-color: #3a465e; }
-                QDoubleSpinBox:focus { border-color: #4b6ea8; }
                 QDoubleSpinBox:disabled {
                     color: #5f6878;
                     background-color: #121722;
@@ -2647,6 +4351,8 @@ if HAS_QT:
                 }
                 QPushButton#btnStepper {
                     padding: 0px;
+                    min-height: 30px;
+                    max-height: 30px;
                     font-size: 15px;
                     font-weight: 600;
                     background-color: #1a2030;
@@ -2668,8 +4374,28 @@ if HAS_QT:
                     border-color: #1f2633;
                 }
 
+                QPushButton#btnCustomLed {
+                    padding: 0px;
+                    min-height: 30px;
+                    max-height: 30px;
+                }
+
+                QPushButton#btnMute {
+                    padding: 0px;
+                    min-height: 30px;
+                    max-height: 30px;
+                }
+
+                QPushButton#btnFgRecheck {
+                    padding: 0px 8px;
+                    min-height: 22px;
+                    max-height: 22px;
+                }
+
                 QPushButton {
-                    padding: 6px 14px;
+                    min-height: 22px;
+                    max-height: 22px;
+                    padding: 4px 14px;
                     font-size: 12px;
                     font-weight: 500;
                     border-radius: 6px;
@@ -2694,6 +4420,24 @@ if HAS_QT:
                     background-color: #1a2030;
                     color: #e6e9ef;
                     border-color: #3a465e;
+                }
+
+                QPushButton#btnAdvancedExpand {
+                    background-color: #141822;
+                    color: #cbd5e1;
+                    border: 1px solid #222938;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    padding: 4px 12px;
+                    text-align: left;
+                    min-height: 22px;
+                    max-height: 22px;
+                }
+                QPushButton#btnAdvancedExpand:hover {
+                    background-color: #1c2230;
+                    color: #ffffff;
+                    border-color: #3b82f6;
                 }
 
                 QPushButton#btnLaunchStart {
@@ -2798,25 +4542,25 @@ if HAS_QT:
             lbl_logo.setObjectName("logoTitle")
             top_bar.addWidget(lbl_logo, 0, Qt.AlignVCenter)
 
-            model_label = MODEL_NAMES.get(
-                self.model, MODEL_NAMES[MODEL_GC573])
-            lbl_badge = QLabel(model_label if self.vfio_mode
-                               else model_label.split(" · ", 1)[0])
-            lbl_badge.setObjectName("badgeModel")
-            lbl_badge.setFixedHeight(24)
-            lbl_badge.setAlignment(Qt.AlignCenter)
-            top_bar.addWidget(lbl_badge, 0, Qt.AlignVCenter)
-
             lbl_ver = QLabel(f"v{__version__}")
             lbl_ver.setObjectName("logoVersion")
             top_bar.addWidget(lbl_ver, 0, Qt.AlignVCenter)
 
             top_bar.addStretch(1)
 
+            btn_github = QPushButton("GitHub")
+            btn_github.setObjectName("btnGhost")
+            btn_github.setFixedHeight(32)
+            btn_github.setStyleSheet("padding: 0px 14px;")
+            btn_github.setCursor(Qt.PointingHandCursor)
+            btn_github.setToolTip("Visit EverLive on GitHub (Upstream Repository)")
+            btn_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/Everlite/EverLive")))
+            top_bar.addWidget(btn_github, 0, Qt.AlignVCenter)
+
             btn_discord = QPushButton("Discord")
             btn_discord.setObjectName("btnGhost")
-            btn_discord.setFixedHeight(28)
-            btn_discord.setStyleSheet("padding: 0px 12px;")
+            btn_discord.setFixedHeight(32)
+            btn_discord.setStyleSheet("padding: 0px 14px;")
             btn_discord.setCursor(Qt.PointingHandCursor)
             btn_discord.setToolTip("Join the EverLive Discord community (Feedback & Hardware Support)")
             btn_discord.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://discord.com/invite/D2XFhkPMmc")))
@@ -2824,7 +4568,7 @@ if HAS_QT:
 
             self.lbl_pill = QLabel(ENGINE_VFIO_TEXT if self.vfio_mode else "○ Standby")
             self.lbl_pill.setObjectName("pillLive")
-            self.lbl_pill.setFixedHeight(28)
+            self.lbl_pill.setFixedHeight(32)
             self.lbl_pill.setAlignment(Qt.AlignCenter)
             if self.vfio_mode:
                 self.lbl_pill.setStyleSheet("background-color: #122a22; color: #7fd1ad; border: 1px solid #1e3c31;")
@@ -2835,169 +4579,350 @@ if HAS_QT:
             root_layout.addWidget(header_widget)
 
             # -------------------------------------------------------------
-            # Hero: live signal, telemetry and runtime actions
+            # Main Viewing Area: Video Feed (Left) & Simple Controls (Right)
             # -------------------------------------------------------------
-            card_hero = QFrame()
-            card_hero.setObjectName("cardFrame")
-            v_hero = QVBoxLayout(card_hero)
-            v_hero.setSpacing(10)
-            v_hero.setContentsMargins(14, 12, 14, 14)
+            main_h_layout = QHBoxLayout()
+            main_h_layout.setContentsMargins(0, 0, 0, 0)
+            main_h_layout.setSpacing(14)
+
+            # --- Left Column: Video Feed & Signal Telemetry (No container background) ---
+            widget_video_col = QWidget()
+            v_video_col = QVBoxLayout(widget_video_col)
+            v_video_col.setContentsMargins(0, 0, 0, 0)
+            v_video_col.setSpacing(8)
 
             h_sig_info = QHBoxLayout()
             h_sig_info.setSpacing(12)
             v_sig_text = QVBoxLayout()
-            v_sig_text.setSpacing(6)
+            v_sig_text.setSpacing(4)
 
-            self.lbl_hero_signal = QLabel("Waiting for HDMI signal...")
+            self.lbl_hero_signal = QLabel(self.card_display_name)
             self.lbl_hero_signal.setObjectName("heroSignal")
             self.lbl_hero_signal.setMinimumHeight(28)
             v_sig_text.addWidget(self.lbl_hero_signal)
 
-            self.lbl_hero_meta = QLabel("Checking input source (Console / PC)...")
+            self.lbl_hero_meta = QLabel("No HDMI Signal • Waiting for input • No Audio")
             self.lbl_hero_meta.setObjectName("heroMeta")
             self.lbl_hero_meta.setMinimumHeight(18)
             v_sig_text.addWidget(self.lbl_hero_meta)
 
             h_sig_info.addLayout(v_sig_text, 1)
 
-            self.lbl_engine_badge = QLabel(
-                "Userspace VFIO" if self.vfio_mode
-                else "Direct Wayland (< 2ms)")
-            self.lbl_engine_badge.setObjectName("engineBadge")
-            self.lbl_engine_badge.setFixedHeight(26)
-            self.lbl_engine_badge.setAlignment(Qt.AlignCenter)
-            if self.vfio_mode:
-                self.lbl_engine_badge.setToolTip(
-                    "Blob-free Ring-3 VFIO engine • SDL2 video and HDMI audio")
-            h_sig_info.addWidget(self.lbl_engine_badge, 0, Qt.AlignVCenter)
+            # Hidden dummy badge so legacy setText callers succeed without duplicate pill
+            self.lbl_audio_fmt = QLabel("")
+            self.lbl_audio_fmt.setVisible(False)
 
-            v_hero.addLayout(h_sig_info)
+            # Redundant engine badge removed; header's lbl_pill already indicates it
+            self.lbl_engine_badge = None
 
-            # Telemetry row: the detected audio format lives here instead of
-            # being buried in the settings form.
-            h_telemetry = QHBoxLayout()
-            h_telemetry.setSpacing(8)
-            self.lbl_audio_fmt = QLabel("No Audio")
-            self.lbl_audio_fmt.setObjectName("audioFormat")
-            self.lbl_audio_fmt.setFixedHeight(24)
-            self.lbl_audio_fmt.setAlignment(Qt.AlignCenter)
-            self.lbl_audio_fmt.setToolTip(
-                "Audio format detected by the userspace engine from the "
-                "IT6805 / SDL2 stream log.")
-            h_telemetry.addWidget(self.lbl_audio_fmt, 0, Qt.AlignVCenter)
-            h_telemetry.addStretch(1)
+            v_video_col.addLayout(h_sig_info)
+
+            # Embedded Live Video Feed Canvas (directly in layout, no enclosing container background)
+            self.video_canvas = EmbeddedVideoCanvas(self, duo_mode=self.duo_mode)
+            self.video_canvas.setStyleSheet("background-color: transparent;")
+            self.canvas = self.video_canvas
+            saved_input = load_settings().get("duo_input", 0)
+            self.video_canvas.set_port(saved_input)
+            self.video_canvas.fullscreen_requested.connect(self.toggle_fullscreen)
+            self.video_canvas.toggle_play_requested.connect(self.toggle_stream)
+            if self.duo_mode:
+                self.video_canvas.port_requested.connect(
+                    lambda p: self.combo_duo_input.setCurrentIndex(1 if p == 1 else 0) if hasattr(self, "combo_duo_input") else None)
+            v_video_col.addWidget(self.video_canvas, 1)
+
+            main_h_layout.addWidget(widget_video_col, 1)
+
+            # --- Right Column: Scrollable Control Panel (Quick Controls + Expandable Advanced) ---
+            card_side = QFrame()
+            card_side.setObjectName("cardFrame")
+            card_side.setFixedWidth(320)
+
+            v_side_frame = QVBoxLayout(card_side)
+            v_side_frame.setContentsMargins(0, 0, 0, 0)
+            v_side_frame.setSpacing(0)
+
+            scroll_side = QScrollArea()
+            scroll_side.setWidgetResizable(True)
+            scroll_side.setFrameShape(QFrame.NoFrame)
+            scroll_side.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll_side.setStyleSheet("""
+                QScrollArea {
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar:vertical {
+                    background: transparent;
+                    width: 6px;
+                    margin: 0px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:vertical {
+                    background: #232c3d;
+                    min-height: 20px;
+                    border-radius: 3px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: #3b82f6;
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
+                }
+            """)
+
+            content_side = QWidget()
+            content_side.setStyleSheet("background: transparent;")
+            v_side = QVBoxLayout(content_side)
+            v_side.setContentsMargins(12, 10, 12, 12)
+            v_side.setSpacing(0)
+
+            lbl_side_title = QLabel("QUICK CONTROLS")
+            lbl_side_title.setObjectName("sectionHeader")
+            v_side.addWidget(lbl_side_title)
+            v_side.addSpacing(12)
 
             if self.duo_mode:
-                lbl_duo = QLabel("DUO Input")
-                lbl_duo.setObjectName("heroMeta")
-                h_telemetry.addWidget(lbl_duo, 0, Qt.AlignVCenter)
+                lbl_duo_hdr = QLabel("DUO INPUT")
+                lbl_duo_hdr.setObjectName("sectionTitle")
+                lbl_duo_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+                v_side.addWidget(lbl_duo_hdr)
+                v_side.addSpacing(4)
+
                 self.combo_duo_input = QComboBox()
+                self._style_combobox(self.combo_duo_input)
                 self.combo_duo_input.addItem("HDMI 1", 0)
                 self.combo_duo_input.addItem("HDMI 2", 1)
-                saved_input = load_settings().get("duo_input", 0)
                 self.combo_duo_input.setCurrentIndex(1 if saved_input == 1 else 0)
                 self.combo_duo_input.setToolTip(
                     "Select which Live Gamer DUO HDMI input is shown in the "
                     "gaming window and primary capture stream.")
                 self.combo_duo_input.currentIndexChanged.connect(
                     self.on_duo_input_changed)
-                h_telemetry.addWidget(self.combo_duo_input, 0, Qt.AlignVCenter)
+                v_side.addWidget(self.combo_duo_input)
+                v_side.addSpacing(6)
 
-            v_hero.addLayout(h_telemetry)
+                btn_hpd = QPushButton("Pulse HPD")
+                btn_hpd.setObjectName("btnGhost")
+                btn_hpd.setCursor(Qt.PointingHandCursor)
+                btn_hpd.setFixedHeight(32)
+                btn_hpd.setToolTip(
+                    "Re-trigger the HDMI hot-plug handshake on the selected input.")
+                btn_hpd.clicked.connect(self._duo_hpd_action)
+                v_side.addWidget(btn_hpd)
+                v_side.addSpacing(6)
 
-            # Runtime actions in one row: start/stop, studio, re-sync.
-            h_actions = QHBoxLayout()
-            h_actions.setSpacing(8)
+                h_edid = QHBoxLayout()
+                h_edid.setSpacing(6)
 
-            self.btn_launch = QPushButton("Start Gaming Screen")
-            self.btn_launch.setObjectName("btnLaunchStart")
-            self.btn_launch.setCursor(Qt.PointingHandCursor)
-            self.btn_launch.setMinimumHeight(38)
-            self.btn_launch.clicked.connect(self.toggle_stream)
-            h_actions.addWidget(self.btn_launch, 3)
-
-            self.btn_studio = QPushButton("Start Studio / Headless (OBS)")
-            self.btn_studio.setObjectName("btnStudioStart")
-            self.btn_studio.setCursor(Qt.PointingHandCursor)
-            self.btn_studio.setMinimumHeight(38)
-            self.btn_studio.setToolTip(
-                "Runs the userspace engine headless and publishes native video & audio "
-                "to PipeWire, Userspace SHM (libgc570d-v4l2.so), and optional V4L2 for OBS/Discord.")
-            self.btn_studio.clicked.connect(self.toggle_studio)
-            if not self.vfio_mode:
-                self.btn_studio.setEnabled(False)
-                self.btn_studio.setToolTip(
-                    "Studio / headless mode requires the userspace VFIO engine.")
-            h_actions.addWidget(self.btn_studio, 2)
-
-            self.btn_resync = QPushButton(
-                "Restart Engine" if self.vfio_mode else "Re-sync")
-            self.btn_resync.setObjectName("btnGhost")
-            self.btn_resync.setCursor(Qt.PointingHandCursor)
-            self.btn_resync.setMinimumHeight(38)
-            self.btn_resync.setFixedWidth(148)
-            self.btn_resync.setToolTip(
-                "Restart the userspace VFIO engine. HDMI hot-switching is automatic."
-                if self.vfio_mode else
-                "Trigger hardware HDMI handshake (HPD pulse) - also key 'H' in window")
-            self.btn_resync.clicked.connect(self.force_resync)
-            h_actions.addWidget(self.btn_resync, 0)
-
-            v_hero.addLayout(h_actions)
-
-            if self.duo_mode:
-                v_hero.addSpacing(2)
-                h_duo = QHBoxLayout()
-                h_duo.setSpacing(8)
-                btn_bridge = QPushButton("EDID: Internal Bridge")
+                btn_bridge = QPushButton("Bridge EDID")
                 btn_bridge.setObjectName("btnGhost")
                 btn_bridge.setCursor(Qt.PointingHandCursor)
-                btn_bridge.setMinimumHeight(32)
+                btn_bridge.setFixedHeight(32)
                 btn_bridge.setToolTip(
                     "Advertise the internal 4K60 bridge EDID to HDMI IN 1. "
                     "Required for standalone capture without a downstream TV.")
                 btn_bridge.clicked.connect(
                     lambda: self._duo_edid_action(True))
-                h_duo.addWidget(btn_bridge)
-                btn_copy = QPushButton("EDID: Downstream Copy")
+                h_edid.addWidget(btn_bridge)
+
+                btn_copy = QPushButton("Copy EDID")
                 btn_copy.setObjectName("btnGhost")
                 btn_copy.setCursor(Qt.PointingHandCursor)
-                btn_copy.setMinimumHeight(32)
+                btn_copy.setFixedHeight(32)
                 btn_copy.setToolTip(
                     "Copy the EDID of the display/AVR connected to HDMI OUT.")
                 btn_copy.clicked.connect(
                     lambda: self._duo_edid_action(False))
-                h_duo.addWidget(btn_copy)
-                btn_hpd = QPushButton("Pulse HPD")
-                btn_hpd.setObjectName("btnGhost")
-                btn_hpd.setCursor(Qt.PointingHandCursor)
-                btn_hpd.setMinimumHeight(32)
-                btn_hpd.setToolTip(
-                    "Re-trigger the HDMI hot-plug handshake on the selected input.")
-                btn_hpd.clicked.connect(self._duo_hpd_action)
-                h_duo.addWidget(btn_hpd)
-                h_duo.addStretch(1)
-                v_hero.addLayout(h_duo)
+                h_edid.addWidget(btn_copy)
 
-            root_layout.addWidget(card_hero)
+                v_side.addLayout(h_edid)
+                v_side.addSpacing(16)
+
+            lbl_vol_hdr = QLabel("VOLUME")
+            lbl_vol_hdr.setObjectName("sectionTitle")
+            lbl_vol_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+            v_side.addWidget(lbl_vol_hdr)
+            v_side.addSpacing(6)
+
+            h_vol = QHBoxLayout()
+            h_vol.setSpacing(8)
+            self.btn_mute = QPushButton("Mute")
+            self.btn_mute.setObjectName("btnMute")
+            self.btn_mute.setFixedSize(56, 32)
+            self.btn_mute.setCursor(Qt.PointingHandCursor)
+            self.btn_mute.clicked.connect(self.toggle_mute)
+            h_vol.addWidget(self.btn_mute)
+
+            self.slider_vol = QSlider(Qt.Horizontal)
+            self.slider_vol.setRange(0, 150)
+            self.slider_vol.setToolTip(
+                "Volume 0-150%. Note: Set console audio to 2-channel Linear "
+                "PCM (Stereo) to avoid buffer underruns.")
+            initial_vol = int(self.saved_cfg.get("volume", 1.0) * 100)
+            self.slider_vol.setValue(initial_vol)
+            self.slider_vol.valueChanged.connect(self.on_volume_changed)
+            h_vol.addWidget(self.slider_vol, 1)
+
+            self.lbl_vol = QLabel(f"{initial_vol}%")
+            self.lbl_vol.setFixedWidth(36)
+            self.lbl_vol.setObjectName("fieldLabel")
+            self.lbl_vol.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            h_vol.addWidget(self.lbl_vol)
+
+            if self.vfio_mode:
+                self.btn_mute.setToolTip(
+                    "Mutes the SDL2 HDMI audio stream via PipeWire/PulseAudio.")
+                self.slider_vol.setToolTip(
+                    "Sets the PipeWire volume of the userspace SDL2 HDMI audio stream.")
+            v_side.addLayout(h_vol)
+            v_side.addSpacing(16)
+
+            lbl_layout_hdr = QLabel("AUDIO LAYOUT")
+            lbl_layout_hdr.setObjectName("sectionTitle")
+            lbl_layout_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+            v_side.addWidget(lbl_layout_hdr)
+            v_side.addSpacing(6)
+
+            self.combo_audio_channels = QComboBox()
+            self._style_combobox(self.combo_audio_channels)
+            for label, key in AUDIO_CHANNEL_MODES:
+                self.combo_audio_channels.addItem(label, key)
+            saved_layout = str(self.saved_cfg.get("audio_channels", "auto"))
+            idx = self.combo_audio_channels.findData(saved_layout)
+            self.combo_audio_channels.setCurrentIndex(idx if idx >= 0 else 0)
+            self.combo_audio_channels.currentIndexChanged.connect(
+                self.on_audio_channels_changed)
+            if self.duo_mode:
+                self.combo_audio_channels.setEnabled(False)
+                self.combo_audio_channels.setToolTip(
+                    "The Live Gamer DUO engine publishes stereo only.")
+            v_side.addWidget(self.combo_audio_channels)
+            v_side.addSpacing(16)
+
+            lbl_led_hdr = QLabel("CARD LED")
+            lbl_led_hdr.setObjectName("sectionTitle")
+            lbl_led_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+            v_side.addWidget(lbl_led_hdr)
+            v_side.addSpacing(6)
+
+            h_led = QHBoxLayout()
+            h_led.setContentsMargins(0, 0, 0, 0)
+            h_led.setSpacing(6)
+
+            self.combo_led = QComboBox()
+            self._style_combobox(self.combo_led)
+            self.combo_led.setIconSize(QSize(14, 14))
+            for name, val in LED_MODES.items():
+                icon = create_led_icon(val)
+                if icon:
+                    self.combo_led.addItem(icon, name, val)
+                else:
+                    self.combo_led.addItem(name, val)
+
+            saved_led = self.saved_cfg.get("led_mode", None)
+            if self.vfio_mode:
+                led_mode = saved_led if isinstance(saved_led, int) and 0 <= saved_led <= 9 else 4
+                idx = self.combo_led.findData(led_mode)
+                if idx >= 0:
+                    self.combo_led.setCurrentIndex(idx)
+                will_autostart = self._headless_start or self.saved_cfg.get("autostart", True) or getattr(self.streamer, "_cli_autostart", False)
+                if isinstance(saved_led, int) and 0 <= saved_led <= 9 and not will_autostart:
+                    if self.duo_mode:
+                        if _vfio_streamer_running():
+                            set_gc570d_led(saved_led)
+                    else:
+                        set_vfio_led(saved_led)
+            else:
+                if saved_led is not None and isinstance(saved_led, int) and 0 <= saved_led <= 7:
+                    write_led_mode(saved_led)
+                    idx = self.combo_led.findData(saved_led)
+                    if idx >= 0:
+                        self.combo_led.setCurrentIndex(idx)
+                else:
+                    curr_led = read_led_mode()
+                    if curr_led >= 0:
+                        idx = self.combo_led.findData(curr_led)
+                        if idx >= 0:
+                            self.combo_led.setCurrentIndex(idx)
+                    else:
+                        self.combo_led.setEnabled(False)
+            self.combo_led.currentIndexChanged.connect(self.on_led_changed)
+            h_led.addWidget(self.combo_led, 1)
+
+            self.btn_custom_led = QPushButton("")
+            self.btn_custom_led.setObjectName("btnCustomLed")
+            self.btn_custom_led.setToolTip("Pick custom RGB color for card LEDs")
+            picker_icon = create_color_picker_icon(18, "#ffffff")
+            if picker_icon:
+                self.btn_custom_led.setIcon(picker_icon)
+                self.btn_custom_led.setIconSize(QSize(18, 18))
+            self.btn_custom_led.setCursor(Qt.PointingHandCursor)
+            self.btn_custom_led.clicked.connect(self.on_pick_custom_led)
+            saved_hex = self.saved_cfg.get("led_custom_hex", "")
+            if saved_hex:
+                self.btn_custom_led.setStyleSheet(
+                    f"background-color: #1a2030; border: 2px solid {saved_hex}; border-radius: 6px; padding: 0px;"
+                )
+            else:
+                self.btn_custom_led.setStyleSheet(
+                    "background-color: #1a2030; border: 1px solid #2a3242; border-radius: 6px; padding: 0px;"
+                )
+            self.btn_custom_led.setFixedSize(36, 32)
+            h_led.addWidget(self.btn_custom_led)
+            v_side.addLayout(h_led)
+            v_side.addSpacing(16)
+
+            lbl_eng_hdr = QLabel("CAPTURE ENGINE")
+            lbl_eng_hdr.setObjectName("sectionTitle")
+            lbl_eng_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+            v_side.addWidget(lbl_eng_hdr)
+            v_side.addSpacing(6)
+
+            self.btn_resync = QPushButton(
+                "Restart Engine" if self.vfio_mode else "Re-sync Signal")
+            self.btn_resync.setObjectName("btnGhost")
+            self.btn_resync.setCursor(Qt.PointingHandCursor)
+            self.btn_resync.setFixedHeight(32)
+            self.btn_resync.setToolTip(
+                "Restart the userspace VFIO engine. HDMI hot-switching is automatic."
+                if self.vfio_mode else
+                "Trigger hardware HDMI handshake (HPD pulse) - also key 'H' in window")
+            self.btn_resync.clicked.connect(self.force_resync)
+            v_side.addWidget(self.btn_resync)
+            v_side.addSpacing(6)
+
+
+            # Expandable Advanced Menu toggle under Quick Controls
+            self.btn_advanced = QPushButton("Advanced Settings  ▾" if self.is_advanced_mode else "Advanced Settings  ▸")
+            self.btn_advanced.setObjectName("btnAdvancedExpand")
+            self.btn_advanced.setFixedHeight(32)
+            self.btn_advanced.setCursor(Qt.PointingHandCursor)
+            self.btn_advanced.setToolTip("Expand or collapse advanced hardware EDID, frame generation, OBS, and app options")
+            self.btn_advanced.clicked.connect(self.toggle_advanced_mode)
+            self.btn_pro_mode = self.btn_advanced
+            v_side.addWidget(self.btn_advanced)
+            v_side.addSpacing(14)
+
+            # Advanced Settings Container Widget (toggled by btn_advanced)
+            self.widget_advanced = QWidget()
+            self.widget_advanced.setStyleSheet("background: transparent;")
+            v_adv = QVBoxLayout(self.widget_advanced)
+            v_adv.setContentsMargins(0, 0, 0, 0)
+            v_adv.setSpacing(16)
 
             # -------------------------------------------------------------
             # Settings: three calm, thematically grouped sections
             # -------------------------------------------------------------
             def _section(title):
-                frame = QFrame()
-                frame.setObjectName("cardFrame")
+                frame = QWidget()
+                frame.setStyleSheet("background: transparent;")
                 lay = QVBoxLayout(frame)
-                lay.setContentsMargins(14, 10, 14, 12)
-                lay.setSpacing(8)
+                lay.setContentsMargins(0, 0, 0, 0)
+                lay.setSpacing(0)
                 head = QLabel(title)
                 head.setObjectName("sectionTitle")
+                head.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px; padding-top: 4px; padding-bottom: 6px;")
                 lay.addWidget(head)
-                grid = QGridLayout()
-                grid.setHorizontalSpacing(14)
-                grid.setVerticalSpacing(6)
-                lay.addLayout(grid)
-                return frame, grid
+                return frame, lay
 
             def _field(text, tip=""):
                 lbl = QLabel(text)
@@ -3007,18 +4932,35 @@ if HAS_QT:
                 return lbl
 
             # --- Section A: video & color -------------------------------
-            card_video, grid_video = _section("VIDEO & COLOR")
-            grid_video.setColumnMinimumWidth(0, 148)
-            grid_video.setColumnStretch(1, 1)
-            grid_video.setColumnMinimumWidth(2, 92)
-            grid_video.setColumnStretch(3, 1)
+            card_video, lay_video = _section("VIDEO & COLOR")
 
-            grid_video.addWidget(_field(
-                "Hardware EDID Profile" if self.vfio_mode else "Format / Preset"),
-                0, 0)
+            lay_video.addWidget(_field(
+                "Hardware EDID Profile" if self.vfio_mode else "Format / Preset"))
+            lay_video.addSpacing(4)
 
             self.combo_presets = QComboBox()
-            if self.vfio_mode:
+            self._style_combobox(self.combo_presets)
+            if self.duo_mode:
+                duo_formats = [
+                    ("Auto (HDMI Native Sync)", "auto"),
+                    ("1080p @ 60 FPS (1920×1080)", "1080p60"),
+                    ("1080p @ 50 FPS (PAL)", "1080p50"),
+                    ("1080p @ 30 FPS", "1080p30"),
+                    ("1080p @ 24 FPS (Cinema)", "1080p24"),
+                    ("1080i @ 60/50 FPS (Interlaced)", "1080i"),
+                    ("720p @ 60 FPS (1280×720)", "720p60"),
+                    ("720p @ 50 FPS (PAL)", "720p50"),
+                    ("720x576 @ 50 FPS (576p PAL)", "576p"),
+                    ("720x480 @ 60 FPS (480p NTSC)", "480p"),
+                    ("640x480 @ 60 FPS (VGA)", "640x480"),
+                ]
+                for text, key in duo_formats:
+                    self.combo_presets.addItem(text, key)
+                self.combo_presets.setEnabled(True)
+                self.combo_presets.setToolTip(
+                    "Hardware capture modes supported by Live Gamer DUO. "
+                    "In Auto mode, the card automatically locks onto the incoming HDMI clock and timing.")
+            elif self.vfio_mode:
                 for text, key in EDID_PROFILES:
                     self.combo_presets.addItem(text, key)
                 saved_profile = self.saved_cfg.get("edid_profile", "default")
@@ -3043,22 +4985,27 @@ if HAS_QT:
                 self.combo_presets.addItems(list(PRESETS.keys()))
                 if "preset" in self.saved_cfg and self.saved_cfg["preset"] in PRESETS:
                     self.combo_presets.setCurrentText(self.saved_cfg["preset"])
-            # activated (not currentIndexChanged) so re-picking the custom
-            # entry opens the file dialog again.
             self.combo_presets.activated.connect(self.on_preset_changed)
-            if self.duo_mode:
-                self.combo_presets.setEnabled(False)
-                self.combo_presets.setToolTip(
-                    "The Live Gamer DUO selects the EDID policy with the "
-                    "Internal Bridge / Downstream Copy buttons above.")
-            grid_video.addWidget(self.combo_presets, 0, 1)
+            lay_video.addWidget(self.combo_presets)
+            lay_video.addSpacing(6)
 
-            grid_video.addWidget(_field(
+            self.btn_import_modeline = QPushButton("Import Modeline (Custom EDID)...")
+            self.btn_import_modeline.setObjectName("btnGhost")
+            self.btn_import_modeline.setFixedHeight(32)
+            self.btn_import_modeline.setCursor(Qt.PointingHandCursor)
+            self.btn_import_modeline.setToolTip("Import custom X11/xrandr modeline and generate EDID profile")
+            self.btn_import_modeline.clicked.connect(self.on_import_modeline)
+            lay_video.addWidget(self.btn_import_modeline)
+            lay_video.addSpacing(12)
+
+            lay_video.addWidget(_field(
                 "Aspect Ratio",
                 "Overrides SDL2 presentation. Auto follows the native HDMI "
-                "timing; 16:9 fixes anamorphic RetroTINK/OSSC modes."), 0, 2)
+                "timing; 16:9 fixes anamorphic RetroTINK/OSSC modes."))
+            lay_video.addSpacing(4)
 
             self.combo_aspect = QComboBox()
+            self._style_combobox(self.combo_aspect)
             for text, key in ASPECT_OPTIONS:
                 self.combo_aspect.addItem(text, key)
             saved_aspect = self.saved_cfg.get("aspect_ratio", "auto")
@@ -3069,12 +5016,14 @@ if HAS_QT:
                 "Forwarded as --aspect to gc573_user_streamer unless "
                 "'Auto (Native HDMI)' is selected.")
             self.combo_aspect.currentIndexChanged.connect(self.on_aspect_changed)
-            grid_video.addWidget(self.combo_aspect, 0, 3)
+            lay_video.addWidget(self.combo_aspect)
+            lay_video.addSpacing(12)
 
-            grid_video.addWidget(_field(
+            lay_video.addWidget(_field(
                 "HDR Tonemapping",
                 "Maps BT.2020 PQ/HLG signals to BT.709 SDR for both the "
-                "gaming window and the OBS loopback feed (hotkey: H)."), 1, 0)
+                "gaming window and the OBS loopback feed (hotkey: H)."))
+            lay_video.addSpacing(6)
 
             self.chk_hdr = QCheckBox("HDR10 / HLG → SDR")
             self.chk_hdr.setChecked(bool(self.saved_cfg.get("hdr_tonemap", True)))
@@ -3082,10 +5031,20 @@ if HAS_QT:
                 "Forwarded as --no-hdr when unchecked. Applies live over IPC "
                 "while the engine runs.")
             self.chk_hdr.toggled.connect(self.on_hdr_toggled)
-            grid_video.addWidget(self.chk_hdr, 1, 1)
+            lay_video.addWidget(self.chk_hdr)
+            lay_video.addSpacing(4)
 
-            grid_video.addWidget(_field(
-                "Exposure", "Linear exposure bias (-2.0 .. +2.0 EV)."), 1, 2)
+            self.chk_hdr_passthrough = QCheckBox("Passthrough")
+            self.chk_hdr_passthrough.setChecked(bool(self.saved_cfg.get("hdr_passthrough", False)))
+            self.chk_hdr_passthrough.setToolTip(
+                "Direct BT.2020 PQ/HLG passthrough to HDR-capable displays (bypasses SDR tonemapping).")
+            self.chk_hdr_passthrough.toggled.connect(self.on_hdr_passthrough_toggled)
+            lay_video.addWidget(self.chk_hdr_passthrough)
+            lay_video.addSpacing(12)
+
+            lay_video.addWidget(_field(
+                "Exposure", "Linear exposure bias (-2.0 .. +2.0 EV)."))
+            lay_video.addSpacing(4)
 
             h_exposure = QHBoxLayout()
             h_exposure.setContentsMargins(0, 0, 0, 0)
@@ -3093,7 +5052,7 @@ if HAS_QT:
 
             self.spin_hdr_exposure = QDoubleSpinBox()
             self.spin_hdr_exposure.setButtonSymbols(QAbstractSpinBox.NoButtons)
-            self.spin_hdr_exposure.setFixedHeight(34)
+            self.spin_hdr_exposure.setFixedHeight(32)
             self.spin_hdr_exposure.setRange(-2.0, 2.0)
             self.spin_hdr_exposure.setSingleStep(0.1)
             self.spin_hdr_exposure.setDecimals(1)
@@ -3101,7 +5060,7 @@ if HAS_QT:
             self.spin_hdr_exposure.setValue(
                 float(self.saved_cfg.get("hdr_exposure", 0.0)))
             self.spin_hdr_exposure.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self.spin_hdr_exposure.lineEdit().setTextMargins(10, 0, 10, 0)
+            self.spin_hdr_exposure.lineEdit().setTextMargins(8, 0, 8, 0)
             self.spin_hdr_exposure.setToolTip(
                 "Linear exposure bias for the tonemapper (-2.0 .. +2.0 EV).")
             self.spin_hdr_exposure.setEnabled(self.chk_hdr.isChecked())
@@ -3111,7 +5070,7 @@ if HAS_QT:
 
             self.btn_hdr_exp_minus = QPushButton("−")
             self.btn_hdr_exp_minus.setObjectName("btnStepper")
-            self.btn_hdr_exp_minus.setFixedSize(34, 34)
+            self.btn_hdr_exp_minus.setFixedSize(32, 32)
             self.btn_hdr_exp_minus.setCursor(Qt.PointingHandCursor)
             self.btn_hdr_exp_minus.setFocusPolicy(Qt.NoFocus)
             self.btn_hdr_exp_minus.setAutoRepeat(True)
@@ -3123,7 +5082,7 @@ if HAS_QT:
 
             self.btn_hdr_exp_plus = QPushButton("+")
             self.btn_hdr_exp_plus.setObjectName("btnStepper")
-            self.btn_hdr_exp_plus.setFixedSize(34, 34)
+            self.btn_hdr_exp_plus.setFixedSize(32, 32)
             self.btn_hdr_exp_plus.setCursor(Qt.PointingHandCursor)
             self.btn_hdr_exp_plus.setFocusPolicy(Qt.NoFocus)
             self.btn_hdr_exp_plus.setAutoRepeat(True)
@@ -3133,16 +5092,18 @@ if HAS_QT:
                 self.spin_hdr_exposure.stepUp)
             h_exposure.addWidget(self.btn_hdr_exp_plus)
 
-            grid_video.addLayout(h_exposure, 1, 3)
+            lay_video.addLayout(h_exposure)
+            lay_video.addSpacing(12)
 
-            grid_video.addWidget(_field(
+            lay_video.addWidget(_field(
                 "Scaling Mode",
                 "Integer Scale picks the largest whole multiple of the "
                 "source (crisp pixels for retro/720p). Falls back to Aspect "
-                "Fit when the monitor is smaller or the content is anamorphic."),
-                2, 0)
+                "Fit when the monitor is smaller or the content is anamorphic."))
+            lay_video.addSpacing(4)
 
             self.combo_scale = QComboBox()
+            self._style_combobox(self.combo_scale)
             for text, key in SCALE_OPTIONS:
                 self.combo_scale.addItem(text, key)
             saved_scale = self.saved_cfg.get("scale_mode", "fit")
@@ -3153,51 +5114,50 @@ if HAS_QT:
                 "Forwarded as --scale. Applies live over IPC while the "
                 "engine runs. Hotkey 'L' in the gaming window cycles it.")
             self.combo_scale.currentIndexChanged.connect(self.on_scale_changed)
-            grid_video.addWidget(self.combo_scale, 2, 1)
+            lay_video.addWidget(self.combo_scale)
 
-            root_layout.addWidget(card_video)
-
-            # --- Section: frame generation --------------------
-            card_fg, grid_fg = _section(
-                "FRAME GENERATION (BETA · LSFG-VK)")
-            grid_fg.setVerticalSpacing(8)
-            grid_fg.setColumnMinimumWidth(0, 148)
-            grid_fg.setColumnStretch(1, 1)
-            grid_fg.setColumnMinimumWidth(2, 140)
-            grid_fg.setColumnStretch(3, 1)
+            # --- Section B: frame generation --------------------
+            card_fg, lay_fg = _section(
+                "EXPERIMENTAL · LSFG-VK FRAME GENERATION")
 
             self._fg_ready_ok = False
-            grid_fg.addWidget(_field(
+            lay_fg.addWidget(_field(
                 "Installation",
                 "Lossless Scaling Frame Generation 3.x through the native "
-                "lsfg-vk 2.0 Vulkan layer (Steam Beta branch 'lsfg-vk')."),
-                0, 0)
+                "lsfg-vk 2.0 Vulkan layer (Steam Beta branch 'lsfg-vk')."))
+            lay_fg.addSpacing(4)
 
             self.lbl_fg_ready = QLabel("Checking lsfg-vk…")
             self.lbl_fg_ready.setObjectName("fieldLabel")
             self.lbl_fg_ready.setWordWrap(True)
-            grid_fg.addWidget(self.lbl_fg_ready, 0, 1, 1, 2, Qt.AlignVCenter)
 
             self.btn_fg_recheck = QPushButton("Re-check")
-            self.btn_fg_recheck.setObjectName("btnGhost")
-            self.btn_fg_recheck.setFixedSize(96, 26)
-            self.btn_fg_recheck.setStyleSheet("padding: 0px 12px;")
+            self.btn_fg_recheck.setObjectName("btnFgRecheck")
+            self.btn_fg_recheck.setFixedSize(86, 32)
+            self.btn_fg_recheck.setStyleSheet("padding: 0px 8px;")
             self.btn_fg_recheck.setCursor(Qt.PointingHandCursor)
             self.btn_fg_recheck.setToolTip(
                 "Re-scan for the lsfg-vk layer and lsfg-vk.dll without "
                 "restarting the Hub.")
             self.btn_fg_recheck.clicked.connect(self.on_fg_recheck)
-            grid_fg.addWidget(
-                self.btn_fg_recheck, 0, 3, Qt.AlignRight | Qt.AlignVCenter)
-            self._refresh_fg_readiness()
 
-            grid_fg.addWidget(_field(
-                "Frame Generation (Beta)",
-                "lsfg-vk 2x (Beta). The 30→60 mode drops the repeated HDMI frame a "
-                "PS5 sends for a 30 FPS game before the layer interpolates."),
-                1, 0)
+            h_fg_head = QHBoxLayout()
+            h_fg_head.setContentsMargins(0, 0, 0, 0)
+            h_fg_head.setSpacing(6)
+            h_fg_head.addWidget(self.lbl_fg_ready, 1)
+            h_fg_head.addWidget(self.btn_fg_recheck, 0)
+            lay_fg.addLayout(h_fg_head)
+            self._refresh_fg_readiness()
+            lay_fg.addSpacing(12)
+
+            lay_fg.addWidget(_field(
+                "Frame Generation",
+                "lsfg-vk 2x. The 30→60 mode drops the repeated HDMI frame a "
+                "PS5 sends for a 30 FPS game before the layer interpolates."))
+            lay_fg.addSpacing(4)
 
             self.combo_framegen = QComboBox()
+            self._style_combobox(self.combo_framegen)
             for text, key in FRAMEGEN_OPTIONS:
                 self.combo_framegen.addItem(text, key)
             fg_idx = self.combo_framegen.findData(
@@ -3209,13 +5169,14 @@ if HAS_QT:
                 "engine runs (hotkey 'g' cycles it in the game window).")
             self.combo_framegen.currentIndexChanged.connect(
                 self.on_framegen_changed)
-            grid_fg.addWidget(self.combo_framegen, 1, 1, 1, 3)
+            lay_fg.addWidget(self.combo_framegen)
+            lay_fg.addSpacing(12)
 
-            grid_fg.addWidget(_field(
+            lay_fg.addWidget(_field(
                 "Flow Scale",
                 "Optical-flow resolution used by LSFG. 100% is full quality; "
-                "lower values cost less GPU time on 1440p/4K captures."),
-                2, 0)
+                "lower values cost less GPU time on 1440p/4K captures."))
+            lay_fg.addSpacing(4)
 
             h_flow = QHBoxLayout()
             h_flow.setContentsMargins(0, 0, 0, 0)
@@ -3235,7 +5196,8 @@ if HAS_QT:
             self.lbl_flow.setObjectName("fieldLabel")
             self.lbl_flow.setFixedWidth(38)
             h_flow.addWidget(self.lbl_flow, 0, Qt.AlignVCenter)
-            grid_fg.addLayout(h_flow, 2, 1)
+            lay_fg.addLayout(h_flow)
+            lay_fg.addSpacing(12)
 
             self.chk_fg_perf = QCheckBox("Performance Mode")
             self.chk_fg_perf.setMinimumHeight(24)
@@ -3245,7 +5207,8 @@ if HAS_QT:
                 "LSFGVK_PERFORMANCE_MODE: lower latency and less GPU load, "
                 "at the cost of some interpolation quality.")
             self.chk_fg_perf.toggled.connect(self.on_fg_perf_toggled)
-            grid_fg.addWidget(self.chk_fg_perf, 2, 2, Qt.AlignVCenter)
+            lay_fg.addWidget(self.chk_fg_perf)
+            lay_fg.addSpacing(4)
 
             self.chk_fg_ll = QCheckBox("Low-Latency Swapchain")
             self.chk_fg_ll.setMinimumHeight(24)
@@ -3256,137 +5219,23 @@ if HAS_QT:
                 "the minimum Vulkan swapchain queue depth (saves 8-17 ms at "
                 "120 Hz). Uncheck if frame pacing ever stutters.")
             self.chk_fg_ll.toggled.connect(self.on_fg_low_latency_toggled)
-            grid_fg.addWidget(self.chk_fg_ll, 2, 3, Qt.AlignVCenter)
+            lay_fg.addWidget(self.chk_fg_ll)
+            lay_fg.addSpacing(6)
 
             self.lbl_fg_status = QLabel(
                 "Frame generation is off (native zero-latency path).")
             self.lbl_fg_status.setObjectName("fieldLabel")
-            grid_fg.addWidget(self.lbl_fg_status, 3, 0, 1, 4)
+            lay_fg.addWidget(self.lbl_fg_status)
             self._refresh_idle_fg_status()
 
             if self.duo_mode:
                 card_fg.setVisible(False)
 
-            root_layout.addWidget(card_fg)
-
-            # --- Section B: audio & hardware ----------------------------
-            card_audio, grid_audio = _section("AUDIO & HARDWARE")
-            grid_audio.setColumnMinimumWidth(0, 148)
-            grid_audio.setColumnStretch(1, 1)
-            grid_audio.setColumnMinimumWidth(2, 92)
-            grid_audio.setColumnStretch(3, 1)
-
-            grid_audio.addWidget(_field(
-                "Volume",
-                "Set console audio to 2-channel Linear PCM (Stereo) to "
-                "prevent audio dropouts / clicks."), 0, 0)
-
-            h_vol = QHBoxLayout()
-            h_vol.setSpacing(8)
-            self.btn_mute = QPushButton("Mute")
-            self.btn_mute.setObjectName("btnMute")
-            self.btn_mute.setFixedWidth(70)
-            self.btn_mute.setCursor(Qt.PointingHandCursor)
-            self.btn_mute.clicked.connect(self.toggle_mute)
-            h_vol.addWidget(self.btn_mute)
-
-            self.slider_vol = QSlider(Qt.Horizontal)
-            self.slider_vol.setRange(0, 150)
-            self.slider_vol.setToolTip(
-                "Volume 0-150%. Note: Set console audio to 2-channel Linear "
-                "PCM (Stereo) to avoid buffer underruns.")
-            initial_vol = int(self.saved_cfg.get("volume", 1.0) * 100)
-            self.slider_vol.setValue(initial_vol)
-            self.slider_vol.valueChanged.connect(self.on_volume_changed)
-            h_vol.addWidget(self.slider_vol, 1)
-
-            self.lbl_vol = QLabel(f"{initial_vol}%")
-            self.lbl_vol.setFixedWidth(36)
-            self.lbl_vol.setObjectName("fieldLabel")
-            h_vol.addWidget(self.lbl_vol)
-
-            if self.vfio_mode:
-                self.btn_mute.setToolTip(
-                    "Mutes the SDL2 HDMI audio stream via PipeWire/PulseAudio.")
-                self.slider_vol.setToolTip(
-                    "Sets the PipeWire volume of the userspace SDL2 HDMI audio stream.")
-            grid_audio.addLayout(h_vol, 0, 1)
-
-            grid_audio.addWidget(_field("Card LED"), 0, 2)
-
-            self.combo_led = QComboBox()
-            self.combo_led.setIconSize(QSize(14, 14))
-            for name, val in LED_MODES.items():
-                icon = create_led_icon(val)
-                if icon:
-                    self.combo_led.addItem(icon, name, val)
-                else:
-                    self.combo_led.addItem(name, val)
-
-            saved_led = self.saved_cfg.get("led_mode", None)
-            if self.vfio_mode:
-                # everlive_userd has no readback path; use the persisted mode
-                # and default to the verified cyan profile.
-                led_mode = saved_led if isinstance(saved_led, int) and 0 <= saved_led <= 9 else 4
-                idx = self.combo_led.findData(led_mode)
-                if idx >= 0:
-                    self.combo_led.setCurrentIndex(idx)
-                will_autostart = self._headless_start or self.saved_cfg.get("autostart", False) or getattr(self.streamer, "_cli_autostart", False)
-                if isinstance(saved_led, int) and 0 <= saved_led <= 9 and not will_autostart:
-                    if self.duo_mode:
-                        # The DUO has no standby LED daemon; only talk to a
-                        # running engine, otherwise the mode is applied by the
-                        # next launch.
-                        if _vfio_streamer_running():
-                            set_gc570d_led(saved_led)
-                    else:
-                        set_vfio_led(saved_led)
-            else:
-                if saved_led is not None and isinstance(saved_led, int) and 0 <= saved_led <= 7:
-                    write_led_mode(saved_led)
-                    idx = self.combo_led.findData(saved_led)
-                    if idx >= 0:
-                        self.combo_led.setCurrentIndex(idx)
-                else:
-                    curr_led = read_led_mode()
-                    if curr_led >= 0:
-                        idx = self.combo_led.findData(curr_led)
-                        if idx >= 0:
-                            self.combo_led.setCurrentIndex(idx)
-                    else:
-                        self.combo_led.setEnabled(False)
-            self.combo_led.currentIndexChanged.connect(self.on_led_changed)
-            grid_audio.addWidget(self.combo_led, 0, 3)
-
-            grid_audio.addWidget(_field(
-                "Audio Layout",
-                "Playback channel layout. Auto follows the HDMI source; "
-                "5.1/7.1 fall back to an ITU-R BS.775 stereo downmix when "
-                "the audio sink cannot open them."), 1, 0)
-
-            self.combo_audio_channels = QComboBox()
-            for label, key in AUDIO_CHANNEL_MODES:
-                self.combo_audio_channels.addItem(label, key)
-            saved_layout = str(self.saved_cfg.get("audio_channels", "auto"))
-            idx = self.combo_audio_channels.findData(saved_layout)
-            self.combo_audio_channels.setCurrentIndex(idx if idx >= 0 else 0)
-            self.combo_audio_channels.currentIndexChanged.connect(
-                self.on_audio_channels_changed)
-            if self.duo_mode:
-                self.combo_audio_channels.setEnabled(False)
-                self.combo_audio_channels.setToolTip(
-                    "The Live Gamer DUO engine publishes stereo only.")
-            grid_audio.addWidget(self.combo_audio_channels, 1, 1, 1, 3)
-
-            root_layout.addWidget(card_audio)
-
             # --- Section C: outputs, overlay & app ----------------------
-            card_out, grid_out = _section("OBS OUTPUTS, OVERLAY & APP")
-            grid_out.setColumnMinimumWidth(0, 108)
-            grid_out.setColumnStretch(1, 1)
-            grid_out.setColumnStretch(2, 1)
+            card_out, lay_out = _section("OBS OUTPUTS, OVERLAY & APP")
 
-            grid_out.addWidget(_field("OBS Routing"), 0, 0)
+            lay_out.addWidget(_field("OBS Routing"))
+            lay_out.addSpacing(6)
 
             has_loopback_node = os.path.exists(V4L2_DEFAULT_DEVICE)
             self.chk_v4l2 = QCheckBox(
@@ -3407,7 +5256,8 @@ if HAS_QT:
                 self.chk_v4l2.setEnabled(False)
                 self.chk_v4l2.setToolTip(
                     "Virtual camera output requires the userspace VFIO engine.")
-            grid_out.addWidget(self.chk_v4l2, 0, 1)
+            lay_out.addWidget(self.chk_v4l2)
+            lay_out.addSpacing(4)
 
             self.chk_audio_tap = QCheckBox("Virtual Audio Track")
             self.chk_audio_tap.setToolTip(
@@ -3420,21 +5270,23 @@ if HAS_QT:
             if not self.vfio_mode:
                 self.chk_audio_tap.setChecked(False)
                 self.chk_audio_tap.setEnabled(False)
-            grid_out.addWidget(self.chk_audio_tap, 0, 2)
+            lay_out.addWidget(self.chk_audio_tap)
+            lay_out.addSpacing(12)
 
-            grid_out.addWidget(_field("Display & HUD"), 1, 0)
+            lay_out.addWidget(_field("Display & HUD"))
+            lay_out.addSpacing(6)
 
             self.chk_fullscreen = QCheckBox("Fullscreen")
             self.chk_fullscreen.setChecked(self.saved_cfg.get("fullscreen", True))
             self.chk_fullscreen.toggled.connect(lambda val: save_settings({"fullscreen": val}))
-            grid_out.addWidget(self.chk_fullscreen, 1, 1)
+            lay_out.addWidget(self.chk_fullscreen)
+            lay_out.addSpacing(4)
 
             self.chk_vsync = QCheckBox("VSync")
             self.chk_vsync.setChecked(self.saved_cfg.get("vsync", self.enable_vsync))
             self.chk_vsync.toggled.connect(lambda val: save_settings({"vsync": val}))
-            grid_out.addWidget(self.chk_vsync, 1, 2)
-
-            grid_out.addWidget(_field(""), 2, 0)
+            lay_out.addWidget(self.chk_vsync)
+            lay_out.addSpacing(4)
 
             self.chk_streamer = QCheckBox("Streamer Mode (Clean Feed)")
             self.chk_streamer.setToolTip(
@@ -3442,10 +5294,9 @@ if HAS_QT:
                 "(Hotkey: 'S')")
             self.chk_streamer.setChecked(self.saved_cfg.get("streamer_mode", False))
             self.chk_streamer.toggled.connect(lambda val: save_settings({"streamer_mode": val}))
-            grid_out.addWidget(self.chk_streamer, 2, 1)
+            lay_out.addWidget(self.chk_streamer)
+            lay_out.addSpacing(4)
 
-            h_osd = QHBoxLayout()
-            h_osd.setSpacing(8)
             self.chk_osd = QCheckBox("On-Screen Stats")
             self.chk_osd.setToolTip(
                 "Live resolution, FPS and audio format drawn by the engine "
@@ -3453,9 +5304,11 @@ if HAS_QT:
                 "the corner.")
             self.chk_osd.setChecked(bool(self.saved_cfg.get("osd_enabled", True)))
             self.chk_osd.toggled.connect(self.on_osd_changed)
-            h_osd.addWidget(self.chk_osd)
+            lay_out.addWidget(self.chk_osd)
+            lay_out.addSpacing(6)
 
             self.combo_osd_pos = QComboBox()
+            self._style_combobox(self.combo_osd_pos)
             for text, key in OSD_POSITION_OPTIONS:
                 self.combo_osd_pos.addItem(text, key)
             saved_pos = self.saved_cfg.get("osd_position", "tr")
@@ -3467,15 +5320,17 @@ if HAS_QT:
                 "overlay never covers console navigation.")
             self.combo_osd_pos.setEnabled(self.chk_osd.isChecked())
             self.combo_osd_pos.currentIndexChanged.connect(self.on_osd_pos_changed)
-            h_osd.addWidget(self.combo_osd_pos, 1)
-            grid_out.addLayout(h_osd, 2, 2)
+            lay_out.addWidget(self.combo_osd_pos)
+            lay_out.addSpacing(12)
 
-            grid_out.addWidget(_field("App Behavior"), 3, 0)
+            lay_out.addWidget(_field("App Behavior"))
+            lay_out.addSpacing(6)
 
             self.chk_autostart = QCheckBox("Auto-start on launch")
-            self.chk_autostart.setChecked(self.saved_cfg.get("autostart", False))
+            self.chk_autostart.setChecked(self.saved_cfg.get("autostart", True))
             self.chk_autostart.toggled.connect(lambda val: save_settings({"autostart": val}))
-            grid_out.addWidget(self.chk_autostart, 3, 1)
+            lay_out.addWidget(self.chk_autostart)
+            lay_out.addSpacing(4)
 
             self.chk_tray = QCheckBox("Close to Tray")
             self.chk_tray.setToolTip(
@@ -3483,7 +5338,8 @@ if HAS_QT:
                 "tray so it does not clutter Alt-Tab.")
             self.chk_tray.setChecked(bool(self.saved_cfg.get("minimize_to_tray", True)))
             self.chk_tray.toggled.connect(lambda val: save_settings({"minimize_to_tray": val}))
-            grid_out.addWidget(self.chk_tray, 3, 2)
+            lay_out.addWidget(self.chk_tray)
+            lay_out.addSpacing(12)
 
             if self.vfio_mode:
                 self.chk_fullscreen.setToolTip(
@@ -3495,7 +5351,39 @@ if HAS_QT:
                     "Clean feed: hides the on-screen stats overlay and the "
                     "mouse cursor in the game window (Tab/'o' toggles at runtime).")
 
-            root_layout.addWidget(card_out)
+            lay_out.addWidget(_field("Detached Window"))
+            lay_out.addSpacing(4)
+            self.btn_detached = QPushButton("⧉ Launch Detached SDL Window")
+            self.btn_detached.setObjectName("btnGhost")
+            self.btn_detached.setCursor(Qt.PointingHandCursor)
+            self.btn_detached.setFixedHeight(32)
+            self.btn_detached.setToolTip(
+                "Launch the classic detached SDL2 floating window instead of the integrated UI player")
+            self.btn_detached.clicked.connect(self.start_detached_window)
+            lay_out.addWidget(self.btn_detached)
+
+            # Pack Advanced sections into widget_advanced
+            v_adv.addWidget(card_video)
+            v_adv.addWidget(card_fg)
+            v_adv.addWidget(card_out)
+
+            self.widget_advanced.setVisible(self.is_advanced_mode)
+            v_side.addWidget(self.widget_advanced)
+
+            v_side.addStretch(1)
+
+            scroll_side.setWidget(content_side)
+            v_side_frame.addWidget(scroll_side)
+
+            main_h_layout.addWidget(card_side, 0)
+            root_layout.addLayout(main_h_layout, 1)
+
+            self.card_side = card_side
+            self.card_audio = card_side
+            self.card_video = card_video
+            self.card_fg = card_fg
+            self.card_out = card_out
+            self.scroll_advanced = scroll_side
 
             # -------------------------------------------------------------
             # Footer: device path left, hotkeys right
@@ -3511,7 +5399,6 @@ if HAS_QT:
                 self.lbl_vdev = QLabel(
                     f"VFIO {pci} · EDID {self._edid_profile_label()} · "
                     "SDL2 audio")
-                hints_text = "F Fullscreen · Tab OSD · H HDR · P Corner · Esc Exit"
             else:
                 if self.streamer.pw_node:
                     audio_str = f"PipeWire ({self.streamer.pw_node})"
@@ -3519,24 +5406,106 @@ if HAS_QT:
                     audio_str = f"ALSA ({self.streamer.adev})"
                 self.lbl_vdev = QLabel(
                     f"V4L2 {self.streamer.vdev} · Audio {audio_str}")
-                hints_text = "F Fullscreen · Tab OSD · M Mute · H Re-sync · Esc Exit"
             self.lbl_vdev.setObjectName("footerText")
             b_layout.addWidget(self.lbl_vdev)
 
             b_layout.addStretch(1)
 
-            lbl_hints = QLabel(hints_text)
-            lbl_hints.setObjectName("footerText")
-            b_layout.addWidget(lbl_hints)
-
-            root_layout.addStretch(1)
             root_layout.addWidget(bottom_box)
+
+            self._apply_advanced_mode()
+            self._update_framegen_button(self.saved_cfg.get("framegen_mode", "off"))
 
             # Initial status poll
             self.update_status()
 
             # System Tray Integration
             self._init_tray()
+
+        @property
+        def card_display_name(self) -> str:
+            return MODEL_NAMES.get(
+                self.model,
+                "GC570D · Live Gamer DUO" if getattr(self, "duo_mode", False) else "GC573 · Live Gamer 4K"
+            )
+
+        def _format_signal_subtitle(self, info: Optional[Dict] = None) -> str:
+            if info is None:
+                info = getattr(self, "_live", {}) or {}
+
+            canvas_has_signal = bool(hasattr(self, "video_canvas") and self.video_canvas.has_signal)
+            locked = bool(info.get("locked") or canvas_has_signal)
+
+            if not locked:
+                if info.get("starting"):
+                    return "Starting Userspace Engine • Initializing capture • No Audio"
+                if info.get("cached"):
+                    res = info.get("resolution", "")
+                    fps = info.get("framerate", "")
+                    if res and fps:
+                        res_clean = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1×\2\3", str(res))
+                        return f"Last Signal: {res_clean} • {fps} • Waiting for input • No Audio"
+                port_str = f" on HDMI {getattr(self.streamer, 'duo_input', 0) + 1}" if self.duo_mode else ""
+                return f"No HDMI Signal{port_str} • Waiting for input • No Audio"
+
+            # Locked / active signal
+            if canvas_has_signal and not info.get("locked"):
+                cw = self.video_canvas.current_width
+                ch = self.video_canvas.current_height
+                res_str = f"{cw}×{ch}p"
+                fps_str = "60.00 FPS"
+                hdr_str = "SDR"
+            else:
+                res = str(info.get("resolution", "1920x1080p"))
+                res_str = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1×\2\3", res)
+                fps_str = str(info.get("framerate", "60.00 FPS"))
+                if fps_str and not fps_str.endswith("FPS") and not fps_str.endswith("Hz"):
+                    fps_str = f"{fps_str} FPS"
+                hdr_str = info.get("hdr", "SDR")
+                if not hdr_str:
+                    hdr_str = "SDR"
+
+            # L-PCM / Audio label
+            audio_label = ""
+            if hasattr(self, "streamer") and hasattr(self.streamer, "audio_format_label"):
+                audio_label = self.streamer.audio_format_label()
+            if not audio_label or audio_label == "No Audio":
+                audio_state = self.streamer.audio_state() if hasattr(self, "streamer") else {}
+                if audio_state.get("state") == "on":
+                    audio_label = f"L-PCM ({audio_state.get('detail', 'Stereo')})"
+                elif locked:
+                    audio_label = str(info.get("audio") or "L-PCM 48kHz (Stereo)")
+                else:
+                    audio_label = "No Audio"
+
+            return f"{res_str} • {fps_str} • {hdr_str} • {audio_label}"
+
+        @property
+        def is_pro_mode(self):
+            return self.is_advanced_mode
+
+        @is_pro_mode.setter
+        def is_pro_mode(self, val):
+            self.is_advanced_mode = val
+
+        def toggle_advanced_mode(self):
+            self.is_advanced_mode = not self.is_advanced_mode
+            self._apply_advanced_mode()
+            self._update_framegen_button(self.saved_cfg.get("framegen_mode", "off"))
+            save_settings({"ui_mode": "advanced" if self.is_advanced_mode else "simple"})
+
+        def _apply_advanced_mode(self):
+            if hasattr(self, "widget_advanced"):
+                self.widget_advanced.setVisible(self.is_advanced_mode)
+            if hasattr(self, "btn_advanced"):
+                arrow = "▾" if self.is_advanced_mode else "▸"
+                self.btn_advanced.setText(f"Advanced Settings  {arrow}")
+
+        toggle_pro_mode = toggle_advanced_mode
+        _apply_pro_mode = _apply_advanced_mode
+
+        def _on_quick_preset_changed(self, index: int = 0):
+            pass
 
         def _set_launch_running(self, running: bool, mode: Optional[str] = None):
             if running:
@@ -3545,57 +5514,20 @@ if HAS_QT:
             else:
                 self._launch_mode = None
 
-            studio_idle_tip = (
-                "Runs the userspace engine headless and publishes native video & audio "
-                "to PipeWire, Userspace SHM (libgc570d-v4l2.so), and optional V4L2 for OBS/Discord."
-                if self.vfio_mode else
-                "Studio / headless mode requires the userspace VFIO engine.")
+            if hasattr(self, "btn_detached"):
+                if self._launch_mode == "detached":
+                    self.btn_detached.setText("Stop Detached Window")
+                else:
+                    self.btn_detached.setText("⧉ Launch Detached SDL Window")
+                self.btn_detached.setStyle(self.btn_detached.style())
 
-            if self._launch_mode == "studio":
-                # Studio keeps capturing; the gaming window can be opened on
-                # top of the running headless engine without dropping OBS.
-                self.btn_launch.setText("Switch to Gaming Screen")
-                self.btn_launch.setObjectName("btnLaunchSwitch")
-                self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip(
-                    "Seamlessly open the interactive SDL2 gaming window "
-                    "(background capture to OBS remains uninterrupted).")
-                self.btn_studio.setText("Stop Studio")
-                self.btn_studio.setObjectName("btnStudioStop")
-                self.btn_studio.setEnabled(True)
-                self.btn_studio.setToolTip(
-                    "Stop the headless streamer and release the capture card.")
-            elif self._launch_mode == "gaming":
-                self.btn_launch.setText("Stop Gaming Screen")
-                self.btn_launch.setObjectName("btnLaunchStop")
-                self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip(
-                    "Close the gaming window and stop the streamer.")
-                self.btn_studio.setText("Switch to Studio (Headless)")
-                self.btn_studio.setObjectName("btnStudioSwitch")
-                self.btn_studio.setEnabled(self.vfio_mode)
-                self.btn_studio.setToolTip(
-                    "Seamlessly close the gaming window and continue streaming "
-                    "native frames in the background for OBS."
-                    if self.vfio_mode else studio_idle_tip)
-            else:
-                self.btn_launch.setText("Start Gaming Screen")
-                self.btn_launch.setObjectName("btnLaunchStart")
-                self.btn_launch.setEnabled(True)
-                self.btn_launch.setToolTip("")
-                self.btn_studio.setText("Start Studio / Headless (OBS)")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(self.vfio_mode)
-                self.btn_studio.setToolTip(studio_idle_tip)
-
-            for button in (self.btn_launch, self.btn_studio):
-                button.setStyle(button.style())
-
-            if hasattr(self, "lbl_engine_badge"):
-                if self._launch_mode == "studio":
-                    self.lbl_engine_badge.setText("Studio / Headless")
-                elif self._launch_mode == "gaming":
-                    self.lbl_engine_badge.setText("Gaming Mode")
+            if getattr(self, "lbl_engine_badge", None):
+                if self._launch_mode == "detached":
+                    self.lbl_engine_badge.setText("Detached Window")
+                elif self._launch_mode == "gaming" or self.streamer.is_running:
+                    self.lbl_engine_badge.setText("Userspace VFIO")
+                elif self.vfio_mode:
+                    self.lbl_engine_badge.setText("Userspace VFIO")
                 elif self.vfio_mode:
                     self.lbl_engine_badge.setText("Userspace VFIO")
                 else:
@@ -3635,19 +5567,16 @@ if HAS_QT:
                     f"Build it with: make -C tools/{folder}")
                 return False
             if self._remote or ipc_probe() is not None:
-                self._set_vfio_notice(
-                    "Remote Session",
-                    "Another streamer owns the capture card; close it to start "
-                    "a session from here",
-                    seconds=8.0)
-                return False
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                return True
             if _vfio_streamer_running():
-                engine = ("opengc570d-userd" if self.duo_mode
-                          else "gc573_user_streamer")
-                self._set_vfio_notice(
-                    "Userspace Engine Active",
-                    f"An external {engine} instance already owns the device")
-                return False
+                # Userspace streamer is already active and owns the card; attach to it
+                self.streamer.is_running = True
+                self._launch_mode = "gaming"
+                self._vfio_live = True
+                return True
             return True
 
         # -----------------------------------------------------------------
@@ -3690,23 +5619,10 @@ if HAS_QT:
         def _set_remote_ui(self, remote: bool):
             """Mirror the hub between local control and remote observation."""
             if remote:
-                if hasattr(self, "lbl_engine_badge"):
+                if getattr(self, "lbl_engine_badge", None):
                     self.lbl_engine_badge.setText("● Remote Session")
-                self.btn_launch.setText("Remote Session Active")
-                self.btn_launch.setObjectName("btnLaunchStart")
-                self.btn_launch.setEnabled(False)
-                self.btn_launch.setToolTip(
-                    "A userspace streamer started outside this window owns "
-                    "the capture card.")
-                self.btn_studio.setText("Start Studio / Headless (OBS)")
-                self.btn_studio.setObjectName("btnStudioStart")
-                self.btn_studio.setEnabled(False)
-                self.btn_studio.setToolTip(
-                    "Stop the external streamer to start a session from here.")
-                for button in (self.btn_launch, self.btn_studio):
-                    button.setStyle(button.style())
-                # The LED, volume and aspect controls stay live: they now talk
-                # to the running engine over the control socket.
+                if hasattr(self, "btn_detached"):
+                    self.btn_detached.setEnabled(False)
                 if hasattr(self, "combo_led"):
                     self.combo_led.setEnabled(True)
                 self._set_vfio_notice(
@@ -3714,8 +5630,10 @@ if HAS_QT:
                     "Attached to the userspace streamer that owns the card",
                     seconds=6.0)
             else:
-                if hasattr(self, "lbl_engine_badge") and self.vfio_mode:
+                if getattr(self, "lbl_engine_badge", None) and self.vfio_mode:
                     self.lbl_engine_badge.setText("Userspace VFIO")
+                if hasattr(self, "btn_detached"):
+                    self.btn_detached.setEnabled(True)
                 self._set_launch_running(False)
 
         def _poll_remote_status(self):
@@ -3742,26 +5660,14 @@ if HAS_QT:
                 self.lbl_audio_fmt.setText(audio.get("label") or "No Audio")
 
             if signal_info.get("locked"):
-                interlace = "i" if signal_info.get("interlaced") else "p"
-                self.lbl_hero_signal.setText(
-                    f"{signal_info.get('width', 0)} × "
-                    f"{signal_info.get('height', 0)}{interlace} @ "
-                    f"{signal_info.get('rate_hz', 0.0):.2f} Hz")
-                parts = [
-                    f"{video.get('fps', 0.0):.1f} FPS",
-                    f"ring {video.get('ring_buffers', 0)}/"
-                    f"{video.get('ring_channels', 0)}ch",
-                ]
-                if audio.get("label"):
-                    parts.append(audio["label"])
-                if v4l2.get("configured"):
-                    parts.append(
-                        f"V4L2 {v4l2.get('width', 0)}×{v4l2.get('height', 0)}")
-                self.lbl_hero_meta.setText(" • ".join(parts))
+                self.lbl_hero_signal.setText(self.card_display_name)
+                self.lbl_hero_meta.setText(self._format_signal_subtitle(signal_info))
+            elif hasattr(self, "video_canvas") and self.video_canvas.has_signal:
+                self.lbl_hero_signal.setText(self.card_display_name)
+                self.lbl_hero_meta.setText(self._format_signal_subtitle())
             else:
-                self.lbl_hero_signal.setText("No HDMI Signal")
-                self.lbl_hero_meta.setText(
-                    "Remote streamer running • waiting for input")
+                self.lbl_hero_signal.setText(self.card_display_name)
+                self.lbl_hero_meta.setText(self._format_signal_subtitle({"locked": False}))
 
         def _sync_remote_controls(self, status: Dict, audio: Dict):
             """Mirror the engine's settings into the local controls.
@@ -3823,7 +5729,7 @@ if HAS_QT:
                     self.combo_osd_pos.setCurrentIndex(idx)
                     self.combo_osd_pos.blockSignals(False)
 
-            # lsfg-vk: mirror the engine's live state.
+            # Experimental lsfg-vk: mirror the engine's live state.
             fg = status.get("framegen") or {}
             headless = bool(status.get("headless"))
             if hasattr(self, "combo_framegen"):
@@ -3838,6 +5744,7 @@ if HAS_QT:
                         self.combo_framegen.blockSignals(True)
                         self.combo_framegen.setCurrentIndex(idx)
                         self.combo_framegen.blockSignals(False)
+                        self._update_framegen_button(mode)
 
                 if hasattr(self, "chk_fg_perf"):
                     value = fg.get("perf_mode")
@@ -3895,7 +5802,7 @@ if HAS_QT:
                         return self.streamer.apply_duo_led(mode)
                     print("[*] LED mode saved; it is applied when the DUO engine starts.")
                     return True
-                ok = set_vfio_led(mode)
+                ok = set_vfio_led(mode, async_apply=True)
                 if self.streamer.is_running:
                     print("[*] LED colour saved; the active userspace stream keeps cyan until it exits.")
                 return ok
@@ -3930,22 +5837,38 @@ if HAS_QT:
                                      int(color[3:5], 16),
                                      int(color[5:7], 16))
 
+        def toggle_fullscreen(self):
+            if not hasattr(self, "_fullscreen_window") or self._fullscreen_window is None:
+                self._fullscreen_window = FullscreenVideoWindow(self.video_canvas, self)
+            if self._fullscreen_window.isVisible():
+                self._fullscreen_window.close()
+            else:
+                self._fullscreen_window.showFullScreen()
+
         def toggle_stream(self):
             if self._switch_pending:
                 return
-            if self._launch_mode == "studio":
-                # Studio is capturing: hand the card over to the SDL window.
+            if self._launch_mode in ("studio", "detached"):
                 self._switch_mode("gaming")
             elif self._launch_mode == "gaming" or self.streamer.is_running:
                 self._stop_stream()
             else:
-                self.start_gaming_screen()
+                self.start_gaming_screen(detached=False)
+
+        def start_detached_window(self):
+            if self._switch_pending:
+                return
+            if self._launch_mode == "detached":
+                self._stop_stream()
+            elif self.streamer.is_running:
+                self._switch_mode("detached")
+            else:
+                self.start_gaming_screen(detached=True)
 
         def toggle_studio(self):
             if self._switch_pending:
                 return
-            if self._launch_mode == "gaming":
-                # Gaming window is open: keep capturing without it.
+            if self._launch_mode in ("gaming", "detached"):
                 self._switch_mode("studio")
             elif self._launch_mode == "studio" or self.streamer.is_running:
                 self._stop_stream()
@@ -3953,13 +5876,7 @@ if HAS_QT:
                 self.start_studio()
 
         def _switch_mode(self, target: str):
-            """Restart the streamer in the other mode without a manual stop.
-
-            ``GameStreamer.stop()`` blocks until the child has exited (SIGTERM,
-            LED handoff and DMA teardown), so the VFIO group is free again
-            before the next instance claims it.  The restart is deferred so Qt
-            can repaint the button row in between.
-            """
+            """Restart the streamer in the other mode without a manual stop."""
             if self._launch_mode == target or self._switch_pending:
                 return
             if target == "studio" and not self.vfio_mode:
@@ -3969,7 +5886,7 @@ if HAS_QT:
             # VFIO stays bound and the DMA ring / OBS feed never stop.
             if (self._ipc is not None and self._ipc.connected and
                     self.streamer.is_running):
-                mode = "gaming" if target == "gaming" else "headless"
+                mode = "gaming" if target in ("gaming", "detached") else "headless"
                 if self._ipc.set_mode(mode):
                     self.streamer.headless = target == "studio"
                     self._set_launch_running(True, target)
@@ -3982,7 +5899,7 @@ if HAS_QT:
                             "uninterrupted", seconds=6.0)
                     else:
                         self._set_vfio_notice(
-                            "Gaming Screen Opened",
+                            "Gaming Mode Active",
                             "Output switched live - capture kept running",
                             seconds=6.0)
                     print(f"[*] Live mode switch to {target} (no restart)")
@@ -3994,24 +5911,21 @@ if HAS_QT:
                 self._ipc.close()
             self.streamer.stop()
             self._set_launch_running(False)
-            if hasattr(self, "lbl_engine_badge"):
+            if getattr(self, "lbl_engine_badge", None):
                 self.lbl_engine_badge.setText("Switching Mode…")
 
-            # Freeze the row during the handover so the transient idle labels
-            # cannot be clicked twice.
-            self.btn_launch.setEnabled(False)
-            self.btn_studio.setEnabled(False)
-            if target == "studio":
-                self.btn_studio.setText("Switching to Studio…")
+            if hasattr(self, "btn_detached"):
+                self.btn_detached.setEnabled(False)
+
+            if target == "detached":
                 self._set_vfio_notice(
-                    "Switching to Studio",
-                    "Closing the gaming window; the OBS feed keeps running",
+                    "Opening Detached Window",
+                    "Launching external SDL2 floating presentation",
                     seconds=5.0)
             else:
-                self.btn_launch.setText("Switching to Gaming…")
                 self._set_vfio_notice(
-                    "Switching to Gaming Screen",
-                    "Opening the interactive SDL2 window",
+                    "Switching to UI Feed",
+                    "Displaying video directly inside Console Hub",
                     seconds=5.0)
             QTimer.singleShot(250, lambda: self._handoff_launch(target))
 
@@ -4021,7 +5935,6 @@ if HAS_QT:
                 return  # superseded by an explicit stop/start
 
             if _vfio_streamer_running() and self._handoff_tries < 8:
-                # The previous instance is still tearing down; retry shortly.
                 self._handoff_tries += 1
                 QTimer.singleShot(150, lambda: self._handoff_launch(target))
                 return
@@ -4030,8 +5943,6 @@ if HAS_QT:
             self._switch_pending = None
             self._handoff_tries = 0
 
-            # Restore an enabled, idle button row: start_* re-labels it on
-            # success and leaves it usable if its preflight refuses.
             self._set_launch_running(False)
 
             if timed_out:
@@ -4044,26 +5955,32 @@ if HAS_QT:
 
             if target == "studio":
                 self.start_studio()
+            elif target == "detached":
+                self.start_gaming_screen(detached=True)
             else:
-                self.start_gaming_screen()
+                self.start_gaming_screen(detached=False)
 
         def _stop_stream(self):
-            # Cancel any in-flight mode handover so its timer cannot relaunch.
             self._switch_pending = None
             self._handoff_tries = 0
+            if hasattr(self, "_fullscreen_window") and self._fullscreen_window and self._fullscreen_window.isVisible():
+                self._fullscreen_window.close()
             if self._ipc is not None:
                 self._ipc.close()
             self.streamer.stop()
             self._set_launch_running(False)
+            if hasattr(self, "video_canvas"):
+                self.video_canvas._last_seq = 0
+                self.video_canvas.update()
             if self.vfio_mode:
                 QTimer.singleShot(900, self._restore_led_after_stream)
 
         def _set_vfio_notice(self, title: str, detail: str, seconds: float = 8.0):
-            self.lbl_hero_signal.setText(title)
-            self.lbl_hero_meta.setText(detail)
+            self.lbl_hero_signal.setText(self.card_display_name)
+            self.lbl_hero_meta.setText(f"{title} • {detail}")
             self._vfio_notice_until = time.time() + seconds
 
-        def start_gaming_screen(self):
+        def start_gaming_screen(self, detached: bool = False):
             if self.streamer.is_running:
                 return
 
@@ -4117,11 +6034,11 @@ if HAS_QT:
                 })
                 self.streamer.aspect = aspect
                 success = self.streamer.start(
-                    fullscreen=want_fullscreen,
+                    fullscreen=want_fullscreen if detached else False,
                     vsync=want_vsync,
                     streamer_mode=want_streamer,
                     v4l2_device=v4l2_device,
-                    headless=False,
+                    headless=not detached,
                     aspect=aspect,
                     osd=want_osd,
                     osd_pos=osd_pos,
@@ -4135,11 +6052,14 @@ if HAS_QT:
                     fg_perf_mode=fg_cfg["fg_perf_mode"],
                     fg_low_latency=fg_cfg["fg_low_latency"])
                 if success:
-                    self._set_launch_running(True, "gaming")
+                    mode_name = "detached" if detached else "gaming"
+                    self._set_launch_running(True, mode_name)
                     self._vfio_notice_until = 0.0
                     self._vfio_volume_applies = 0
                     self._retry_audio_props()
                     self._check_audio_sink()
+                    if not detached and want_fullscreen:
+                        QTimer.singleShot(250, self.toggle_fullscreen)
                     QTimer.singleShot(350, self._ipc_try_attach)
                 else:
                     self._set_vfio_notice(
@@ -4281,6 +6201,8 @@ if HAS_QT:
                 return
             port = 1 if self.combo_duo_input.itemData(index) == 1 else 0
             self.streamer.set_duo_input(port)
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_port(port)
             label = "HDMI 1" if port == 0 else "HDMI 2"
             if self.streamer.is_running:
                 self._set_vfio_notice(
@@ -4298,6 +6220,8 @@ if HAS_QT:
             self.saved_cfg["aspect_ratio"] = aspect
             self.streamer.aspect = aspect
             save_settings({"aspect_ratio": aspect})
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_aspect(aspect)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_aspect(aspect)
             elif self.duo_mode and self.streamer.is_running:
@@ -4312,6 +6236,8 @@ if HAS_QT:
             self.saved_cfg["scale_mode"] = mode
             self.streamer.scale_mode = mode
             save_settings({"scale_mode": mode})
+            if hasattr(self, "video_canvas"):
+                self.video_canvas.set_scale_mode(mode)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_scale(mode)
             elif self.duo_mode and self.streamer.is_running:
@@ -4392,26 +6318,91 @@ if HAS_QT:
         def on_hdr_toggled(self, enabled: bool):
             save_settings({"hdr_tonemap": bool(enabled)})
             self.saved_cfg["hdr_tonemap"] = bool(enabled)
+            pt = getattr(self, "chk_hdr_passthrough", None)
+            is_pt = pt.isChecked() if pt else False
             if hasattr(self, "spin_hdr_exposure"):
-                self.spin_hdr_exposure.setEnabled(bool(enabled))
+                self.spin_hdr_exposure.setEnabled(bool(enabled) and not is_pt)
             if hasattr(self, "btn_hdr_exp_minus"):
-                self.btn_hdr_exp_minus.setEnabled(bool(enabled))
+                self.btn_hdr_exp_minus.setEnabled(bool(enabled) and not is_pt)
             if hasattr(self, "btn_hdr_exp_plus"):
-                self.btn_hdr_exp_plus.setEnabled(bool(enabled))
+                self.btn_hdr_exp_plus.setEnabled(bool(enabled) and not is_pt)
             if self._ipc is not None and self._ipc.connected:
                 self._ipc.set_hdr(bool(enabled),
-                                  float(self.spin_hdr_exposure.value()))
+                                  float(self.spin_hdr_exposure.value()),
+                                  passthrough=is_pt)
             elif self.streamer.is_running:
                 print("[*] HDR setting saved; applies on the next start.")
+            self.show_toast(f"HDR Tonemap: {'Auto' if enabled else 'Bypass'}")
+
+        def on_hdr_passthrough_toggled(self, enabled: bool):
+            save_settings({"hdr_passthrough": bool(enabled)})
+            self.saved_cfg["hdr_passthrough"] = bool(enabled)
+            if hasattr(self, "spin_hdr_exposure"):
+                self.spin_hdr_exposure.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if hasattr(self, "btn_hdr_exp_minus"):
+                self.btn_hdr_exp_minus.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if hasattr(self, "btn_hdr_exp_plus"):
+                self.btn_hdr_exp_plus.setEnabled(self.chk_hdr.isChecked() and not enabled)
+            if self._ipc is not None and self._ipc.connected:
+                self._ipc.set_hdr(self.chk_hdr.isChecked(),
+                                  float(self.spin_hdr_exposure.value()),
+                                  passthrough=bool(enabled))
+            self.show_toast(f"HDR Passthrough: {'Active' if enabled else 'Off'}")
 
         def on_hdr_exposure_changed(self, value: float):
             save_settings({"hdr_exposure": float(value)})
             self.saved_cfg["hdr_exposure"] = float(value)
+            pt = getattr(self, "chk_hdr_passthrough", None)
+            is_pt = pt.isChecked() if pt else False
             if self._ipc is not None and self._ipc.connected:
-                self._ipc.set_hdr(self.chk_hdr.isChecked(), float(value))
+                self._ipc.set_hdr(self.chk_hdr.isChecked(), float(value), passthrough=is_pt)
+
+        def on_import_modeline(self):
+            dlg = CustomModelineDialog(self)
+            if dlg.exec() == QDialog.Accepted and dlg.generated_edid_path:
+                custom_path = dlg.generated_edid_path
+                clean_name = dlg.profile_name
+                if dlg.chk_activate.isChecked():
+                    self._commit_edid_selection("custom", custom_path)
+                self.show_toast(f"Modeline Imported: {clean_name}")
+
+        def on_pick_custom_led(self):
+            saved_hex = self.saved_cfg.get("led_custom_hex", "#00d8d8")
+            initial = QColor(saved_hex)
+            dlg = RgbColorPickerDialog(initial, self)
+            if dlg.exec() == QDialog.Accepted:
+                color = dlg.get_selected_color()
+                if color.isValid():
+                    r, g, b = color.red(), color.green(), color.blue()
+                    hex_color = color.name()
+                    self.saved_cfg["led_custom_hex"] = hex_color
+                    self.saved_cfg["led_custom_rgb"] = [r, g, b]
+                    save_settings({"led_custom_hex": hex_color, "led_custom_rgb": [r, g, b]})
+                    self.btn_custom_led.setStyleSheet(
+                        f"background-color: #1a2030; border: 2px solid {hex_color}; border-radius: 6px; padding: 0px;"
+                    )
+                    self.btn_custom_led.setFixedSize(36, 32)
+                    if self._ipc is not None and self._ipc.connected:
+                        self._ipc.set_led(r, g, b)
+                    elif self.vfio_mode:
+                        set_vfio_led(4)
+                    self.show_toast(f"LED Color: {hex_color.upper()}")
+
+        def show_toast(self, message: str, duration: float = 3.0):
+            """Trigger an OSD toast notification on both GUI embedded canvas and gaming window."""
+            if hasattr(self, "canvas") and self.canvas is not None:
+                try:
+                    self.canvas.show_toast(message, duration)
+                except Exception:
+                    pass
+            if self._ipc is not None and self._ipc.connected:
+                try:
+                    self._ipc.show_toast(message)
+                except Exception:
+                    pass
 
         # -----------------------------------------------------------------
-        # Frame generation & CAS
+        # Experimental frame generation & CAS
         # -----------------------------------------------------------------
         def _framegen_config(self) -> Dict:
             mode = self.combo_framegen.currentData() or "off"
@@ -4442,7 +6433,37 @@ if HAS_QT:
                     print("[*] Frame generation saved; applies on the next start.")
 
         def on_framegen_changed(self, *_):
+            mode = self.combo_framegen.currentData() if hasattr(self, "combo_framegen") else "off"
+            self._update_framegen_button(mode)
             self._apply_framegen()
+
+        def _update_framegen_button(self, mode: Optional[str] = None):
+            if not mode:
+                mode = self.saved_cfg.get("framegen_mode", "off")
+
+            if hasattr(self, "btn_framegen"):
+                if mode == "60to120":
+                    self.btn_framegen.setText("Frame Generation (LSFG): 60 → 120 FPS")
+                    self.btn_framegen.setStyleSheet(
+                        "background-color: #132a22; color: #6ee7b7; border: 1px solid #10b981; font-weight: 600; border-radius: 6px;"
+                    )
+                    self.btn_framegen.setToolTip("LSFG 2x active: 60 → 120 FPS. Click to switch to 30→60 FPS (PS5 dedup).")
+                elif mode == "30to60":
+                    self.btn_framegen.setText("Frame Generation (LSFG): 30 → 60 FPS")
+                    self.btn_framegen.setStyleSheet(
+                        "background-color: #192538; color: #93c5fd; border: 1px solid #3b82f6; font-weight: 600; border-radius: 6px;"
+                    )
+                    self.btn_framegen.setToolTip("LSFG 2x active: 30 → 60 FPS (PS5 30 FPS deduplication). Click to turn Off.")
+                else:
+                    self.btn_framegen.setText("Frame Generation (LSFG): Off")
+                    self.btn_framegen.setStyleSheet("")
+                    self.btn_framegen.setToolTip("Frame generation is Off (native zero-latency path). Click to enable 60→120 FPS.")
+
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.update_framegen_visual(mode)
+                except Exception:
+                    pass
 
         def on_fg_perf_toggled(self, _enabled: bool):
             self._apply_framegen()
@@ -4524,8 +6545,8 @@ if HAS_QT:
                     "lsfg-vk unavailable - presenting without 2x "
                     "(check the readiness line above).")
                 return
-            label = ("30→60 FPS (Beta · PS5 30 FPS dedup)" if mode == "30to60"
-                     else "60→120 FPS (Beta)")
+            label = ("30→60 FPS (PS5 30 FPS dedup)" if mode == "30to60"
+                     else "60→120 FPS")
             text = (f"Standby: {label} · "
                     f"Flow {int(round(cfg['fg_flow_scale'] * 100))}%")
             if cfg.get("fg_perf_mode"):
@@ -4556,8 +6577,8 @@ if HAS_QT:
                     "(check the readiness line above).")
                 return
 
-            label = ("30→60 FPS (Beta · PS5 30 FPS dedup)" if mode == "30to60"
-                     else "60→120 FPS (Beta)")
+            label = ("30→60 FPS (PS5 30 FPS dedup)" if mode == "30to60"
+                     else "60→120 FPS")
 
             # Studio mode has no window, so no swapchain presents exist yet.
             # The mode is armed and activates on the next Gaming switch.
@@ -4767,61 +6788,41 @@ if HAS_QT:
                 QTimer.singleShot(250, lambda: self._wait_and_restart_after_resync(attempts - 1))
 
         def _show_live(self, info):
-            res = info.get("resolution", "No Signal")
-            fps = info.get("framerate", "")
-            res_clean = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1 × \2\3", res)
+            self.lbl_hero_signal.setText(self.card_display_name)
+            self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
 
             if self.vfio_mode:
                 self.lbl_pill.setText(ENGINE_VFIO_TEXT)
                 self.lbl_pill.setStyleSheet(
                     "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-                self.lbl_hero_signal.setText(f"{res_clean} @ {fps}".strip())
-                chroma_val = info.get("chroma") or "YUV 4:2:2"
-                audio = self.streamer.audio_state()
-                if audio.get("state") == "on":
-                    audio_str = f"SDL2 HDMI Audio ({audio.get('detail')})"
-                elif audio.get("state") in ("absent", "unavailable",
-                                            "unsupported", "error"):
-                    audio_str = "No HDMI audio"
-                else:
-                    audio_str = "SDL2 HDMI Audio"
-                route = (f" • OBS: {self.streamer.v4l2_device}"
-                         if getattr(self.streamer, "v4l2_device", None) else "")
-                # Truthful HDR status instead of the old hardcoded
-                # "Color: Pass-through" text.
-                hdr_state = ("HDR Tonemap: Auto" if self.chk_hdr.isChecked()
-                             else "HDR Bypass")
-                self.lbl_hero_meta.setText(
-                    f"Signal locked • Chroma: {chroma_val}{route} • "
-                    f"{hdr_state} • {audio_str}")
                 if hasattr(self, "lbl_audio_fmt"):
                     self.lbl_audio_fmt.setText(self.streamer.audio_format_label())
                 return
 
+            res = info.get("resolution", "No Signal")
+            fps = info.get("framerate", "")
             hdr_str = f" • {info['hdr']}" if info.get("hdr") else ""
             chroma_str = f" • {info['chroma']}" if info.get("chroma") else ""
             self.lbl_pill.setText(f"● {res} @ {fps}{chroma_str}{hdr_str}")
             self.lbl_pill.setStyleSheet("background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-            self.lbl_hero_signal.setText(f"{res_clean} @ {fps}".strip())
-            hdr_val = info.get('hdr', 'SDR')
-            chroma_val = info.get('chroma', 'YUV 4:2:2')
-            self.lbl_hero_meta.setText(f"Signal locked • Chroma: {chroma_val} • Color: {hdr_val} • Stereo LPCM (PipeWire)")
 
         def _set_vfio_standby(self, info):
+            if hasattr(self, "video_canvas") and self.video_canvas.has_signal:
+                cw = self.video_canvas.current_width
+                ch = self.video_canvas.current_height
+                self._show_live({
+                    "locked": True,
+                    "resolution": f"{cw}x{ch}p",
+                    "framerate": "60.00 FPS",
+                    "chroma": "YUV 4:2:2",
+                    "hdr": "SDR",
+                })
+                return
             self.lbl_pill.setText(ENGINE_VFIO_TEXT)
             self.lbl_pill.setStyleSheet(
                 "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-            if info.get("cached"):
-                res = info.get("resolution", "No Signal")
-                fps = info.get("framerate", "")
-                res_clean = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1 × \2\3", res)
-                self.lbl_hero_signal.setText(f"Last signal: {res_clean} @ {fps}".strip())
-                self.lbl_hero_meta.setText(
-                    "Userspace VFIO engine ready • Waiting for HDMI input")
-            else:
-                self.lbl_hero_signal.setText("Ready for Gaming")
-                self.lbl_hero_meta.setText(
-                    "Userspace VFIO engine ready • Waiting for HDMI input")
+            self.lbl_hero_signal.setText(self.card_display_name)
+            self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
             if hasattr(self, "lbl_audio_fmt"):
                 self.lbl_audio_fmt.setText("No Audio")
 
@@ -4834,6 +6835,10 @@ if HAS_QT:
                 self.lbl_audio_fmt.setText(
                     self.streamer.audio_format_label()
                     if self.streamer.is_running else "No Audio")
+
+            canvas_locked = bool(hasattr(self, "video_canvas") and self.video_canvas.has_signal)
+            info = self.streamer.get_signal_info()
+
             if self.streamer.is_running:
                 if not self.streamer.poll():
                     self._set_launch_running(False)
@@ -4846,7 +6851,6 @@ if HAS_QT:
                         self._set_vfio_standby(self.streamer.get_signal_info())
                     return
 
-                info = self.streamer.get_signal_info()
                 self._live = info
                 if info.get("locked"):
                     # Re-apply a few times: the SDL sink-input appears only after
@@ -4859,17 +6863,48 @@ if HAS_QT:
                         set_audio_mute(self.muted)
                         self._vfio_volume_applies += 1
                     self._show_live(info)
+                elif canvas_locked:
+                    cw = self.video_canvas.current_width
+                    ch = self.video_canvas.current_height
+                    canvas_info = {
+                        "locked": True,
+                        "resolution": f"{cw}x{ch}p",
+                        "framerate": "60.00 FPS",
+                        "chroma": "YUV 4:2:2",
+                        "hdr": "SDR",
+                    }
+                    self._live = canvas_info
+                    if self._vfio_volume_applies < 4:
+                        if self.vfio_mode:
+                            set_audio_stream_unity()
+                        else:
+                            set_audio_volume(self.slider_vol.value())
+                        set_audio_mute(self.muted)
+                        self._vfio_volume_applies += 1
+                    self._show_live(canvas_info)
                 elif info.get("starting"):
-                    self.lbl_hero_signal.setText("Starting Userspace Engine…")
+                    self.lbl_hero_signal.setText(self.card_display_name)
                     self.lbl_hero_meta.setText(
-                        "VFIO DMA ring initialising • SDL2 video/audio")
+                        "Starting Userspace Engine • Initializing capture • No Audio")
                 else:
-                    self.lbl_hero_signal.setText("No HDMI Signal")
-                    self.lbl_hero_meta.setText(
-                        "Userspace engine running • waiting for stable input")
+                    self.lbl_hero_signal.setText(self.card_display_name)
+                    self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
                 return
 
-            info = self.streamer.get_signal_info()
+            if canvas_locked:
+                cw = self.video_canvas.current_width
+                ch = self.video_canvas.current_height
+                canvas_info = {
+                    "locked": True,
+                    "resolution": f"{cw}x{ch}p",
+                    "framerate": "60.00 FPS",
+                    "chroma": "YUV 4:2:2",
+                    "hdr": "SDR",
+                }
+                self._live = canvas_info
+                self._show_live(canvas_info)
+                return
+
             self._live = info
             if time.time() < self._vfio_notice_until:
                 return
@@ -4919,11 +6954,21 @@ if HAS_QT:
                     if info.get("locked") else "No Audio")
             if info["locked"]:
                 self._show_live(info)
+            elif hasattr(self, "video_canvas") and self.video_canvas.has_signal:
+                cw = self.video_canvas.current_width
+                ch = self.video_canvas.current_height
+                self._show_live({
+                    "locked": True,
+                    "resolution": f"{cw}x{ch}p",
+                    "framerate": "60.00 FPS",
+                    "chroma": "YUV 4:2:2",
+                    "hdr": "SDR",
+                })
             else:
                 self.lbl_pill.setText("○ Standby")
                 self.lbl_pill.setStyleSheet("background-color: #1a202c; color: #94a3b8; border: 1px solid #2d3748;")
-                self.lbl_hero_signal.setText("No HDMI Signal")
-                self.lbl_hero_meta.setText("Waiting for input signal (e.g. power on console or PC)...")
+                self.lbl_hero_signal.setText(self.card_display_name)
+                self.lbl_hero_meta.setText(self._format_signal_subtitle())
 
         def _init_tray(self):
             if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -5010,6 +7055,21 @@ if HAS_QT:
                     self._restore_from_tray()
 
         def _force_quit(self):
+            if hasattr(self, "recorder") and self.recorder.is_recording:
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass
+            try:
+                geo_hex = self.saveGeometry().toHex().data().decode("ascii")
+                save_settings({
+                    "window_geometry": geo_hex,
+                    "window_maximized": self.isMaximized(),
+                    "window_width": self.width(),
+                    "window_height": self.height(),
+                })
+            except Exception:
+                pass
             self._switch_pending = None
             self._ipc_shutdown = True
             if self._ipc is not None:
@@ -5027,6 +7087,18 @@ if HAS_QT:
             self._switch_pending = None
             was_running = self.streamer.is_running
 
+            # Save geometry and configuration
+            try:
+                geo_hex = self.saveGeometry().toHex().data().decode("ascii")
+                save_settings({
+                    "window_geometry": geo_hex,
+                    "window_maximized": self.isMaximized(),
+                    "window_width": self.width(),
+                    "window_height": self.height(),
+                })
+            except Exception:
+                pass
+
             # Close to Tray: clicking [X] hides the window into the system tray
             if getattr(self, "chk_tray", None) and self.chk_tray.isChecked() and getattr(self, "tray_icon", None):
                 event.ignore()
@@ -5039,6 +7111,12 @@ if HAS_QT:
                         QSystemTrayIcon.Information,
                         3000)
                 return
+
+            if hasattr(self, "recorder") and self.recorder.is_recording:
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass
 
             self._ipc_shutdown = True
             if self._ipc is not None:
@@ -5233,9 +7311,80 @@ def main():
             if not (_proc_running("everlive_userd") and mode == 4):
                 set_vfio_led(mode)
     else:
-        QGuiApplication.setDesktopFileName("everlive")
         app = QApplication(sys.argv)
         app.setApplicationName("EverLive")
+        app.setStyle("Fusion")
+
+        # Global solid dark palette and popup styling for tooltips and dropdown menus
+        pal = app.palette()
+        pal.setColor(QPalette.ToolTipBase, QColor("#151a24"))
+        pal.setColor(QPalette.ToolTipText, QColor("#f1f5f9"))
+        app.setPalette(pal)
+        QToolTip.setPalette(pal)
+        app.setStyleSheet("""
+            QToolTip {
+                background-color: #151a24;
+                color: #f1f5f9;
+                border: 1px solid #2b3548;
+                border-radius: 5px;
+                padding: 5px 8px;
+                font-size: 11px;
+                opacity: 255;
+            }
+            QComboBox {
+                combobox-popup: 0;
+            }
+            QComboBox QAbstractItemView, QComboBox QListView {
+                background-color: #151a24;
+                color: #f1f5f9;
+                border: 1px solid #2b3548;
+                border-radius: 6px;
+                selection-background-color: #2b4f6e;
+                selection-color: #ffffff;
+                outline: none;
+                padding: 4px;
+            }
+            QComboBox QAbstractItemView::item, QComboBox QListView::item {
+                min-height: 28px;
+                padding: 4px 10px;
+                border-radius: 4px;
+                color: #e6e9ef;
+                background-color: transparent;
+            }
+            QComboBox QAbstractItemView::item:hover, QComboBox QListView::item:hover {
+                background-color: #212a3a;
+                color: #ffffff;
+            }
+            QComboBox QAbstractItemView::item:selected, QComboBox QListView::item:selected {
+                background-color: #2b4f6e;
+                color: #ffffff;
+            }
+            QMenu {
+                background-color: #151a24;
+                color: #f1f5f9;
+                border: 1px solid #2b3548;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 14px;
+                border-radius: 4px;
+                color: #e6e9ef;
+            }
+            QMenu::item:selected {
+                background-color: #2b4f6e;
+                color: #ffffff;
+            }
+        """)
+
+        # Only register desktop file with host portal if a matching .desktop file is installed
+        for candidate in ("everlive-experimental", "everlive"):
+            user_path = os.path.expanduser(f"~/.local/share/applications/{candidate}.desktop")
+            sys_path = f"/usr/share/applications/{candidate}.desktop"
+            if os.path.isfile(user_path) or os.path.isfile(sys_path):
+                app.setDesktopFileName(candidate)
+                break
+
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "everlive.png")
         if os.path.isfile(icon_path):
             app.setWindowIcon(QIcon(icon_path))
@@ -5243,10 +7392,18 @@ def main():
                             headless_start=args.headless, v4l2_device=args.v4l2)
         if not args.tray:
             window.show()
-        code = app.exec()
-        _destroy_qt_objects(app, window)
-        del window
-        sys.exit(code)
+        ret = app.exec()
+
+        # Clean teardown for PySide6 on Python 3.14 to prevent double-free SEGV in Shiboken atexit
+        try:
+            if hasattr(window, "tray_icon") and window.tray_icon:
+                window.tray_icon.hide()
+                window.tray_icon.deleteLater()
+            window.deleteLater()
+            app.processEvents()
+        except Exception:
+            pass
+        os._exit(ret)
 
 
 if __name__ == "__main__":
