@@ -3011,6 +3011,188 @@ if HAS_QT:
     except Exception:
         _lib_core = None
 
+    class StreamRecorder:
+        """Non-blocking background video and audio recorder writing raw capture frames to MP4."""
+
+        def __init__(self):
+            self._proc: Optional[subprocess.Popen] = None
+            self._queue: queue.Queue = queue.Queue(maxsize=120)
+            self._thread: Optional[threading.Thread] = None
+            self._stop_event = threading.Event()
+            self.is_recording = False
+            self.output_path = ""
+            self.start_time = 0.0
+            self.width = 1920
+            self.height = 1080
+            self.fps = 60
+            self.frames_written = 0
+            self.frames_dropped = 0
+
+        @staticmethod
+        def _detect_audio_source() -> Optional[str]:
+            uid = os.getuid() if hasattr(os, "getuid") else 1000
+            sock_pulse = f"/run/user/{uid}/pulse/native"
+            sock_pw = f"/run/user/{uid}/pipewire-0"
+            if not (os.path.exists(sock_pulse) or os.path.exists(sock_pw) or os.environ.get("PULSE_SERVER")):
+                return None
+            try:
+                res = subprocess.run(
+                    ["pactl", "list", "short", "sources"],
+                    capture_output=True, text=True, timeout=0.6
+                )
+                if res.returncode == 0:
+                    lines = res.stdout.strip().splitlines()
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 2 and AUDIO_TAP_NODE in parts[1]:
+                            return parts[1]
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 2 and ".monitor" in parts[1]:
+                            return parts[1]
+                    return "default"
+            except Exception:
+                pass
+            return None
+
+        def start(self, output_dir: Optional[str] = None, width: int = 1920, height: int = 1080, fps: int = 60) -> Tuple[bool, str]:
+            if self.is_recording:
+                return False, "Already recording"
+
+            if not shutil.which("ffmpeg"):
+                return False, "ffmpeg not found in PATH"
+
+            if not output_dir:
+                output_dir = os.path.expanduser("~/Videos")
+                if not os.path.isdir(output_dir):
+                    try:
+                        os.makedirs(output_dir, exist_ok=True)
+                    except OSError:
+                        output_dir = os.path.expanduser("~")
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.output_path = os.path.join(output_dir, f"EverLive_{timestamp}.mp4")
+            self.width = int(width)
+            self.height = int(height)
+            self.fps = max(1, int(round(fps)))
+            self.frames_written = 0
+            self.frames_dropped = 0
+
+            audio_src = self._detect_audio_source()
+
+            def _make_cmd(with_audio: Optional[str]) -> list:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "rawvideo",
+                    "-pixel_format", "yuyv422",
+                    "-video_size", f"{self.width}x{self.height}",
+                    "-framerate", str(self.fps),
+                    "-i", "pipe:0",
+                ]
+                if with_audio:
+                    cmd.extend([
+                        "-f", "pulse",
+                        "-i", with_audio,
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                    ])
+                cmd.extend([
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "20",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    self.output_path,
+                ])
+                return cmd
+
+            proc = None
+            if audio_src:
+                try:
+                    cmd = _make_cmd(audio_src)
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    time.sleep(0.1)
+                    if proc.poll() is not None:
+                        proc = None
+                except Exception:
+                    proc = None
+
+            if proc is None:
+                try:
+                    cmd = _make_cmd(None)
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    time.sleep(0.05)
+                    if proc.poll() is not None:
+                        return False, f"ffmpeg exited with code {proc.poll()}"
+                except Exception as e:
+                    return False, f"Failed to start ffmpeg: {e}"
+
+            self._proc = proc
+            self._queue = queue.Queue(maxsize=120)
+            self._stop_event.clear()
+            self.is_recording = True
+            self.start_time = time.monotonic()
+
+            self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+            self._thread.start()
+            print(f"[*] Started recording to {self.output_path} ({self.width}x{self.height} @ {self.fps}fps)")
+            return True, self.output_path
+
+        def push_frame(self, frame_bytes: bytes, width: int, height: int):
+            if not self.is_recording:
+                return
+            if width != self.width or height != self.height:
+                return
+            try:
+                self._queue.put_nowait(frame_bytes)
+            except queue.Full:
+                self.frames_dropped += 1
+
+        def _writer_loop(self):
+            while not self._stop_event.is_set() or not self._queue.empty():
+                try:
+                    frame = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    if self._proc and self._proc.stdin:
+                        self._proc.stdin.write(frame)
+                        self.frames_written += 1
+                except (BrokenPipeError, OSError, ValueError):
+                    break
+
+        def duration(self) -> float:
+            if not self.is_recording:
+                return 0.0
+            return max(0.0, time.monotonic() - self.start_time)
+
+        def stop(self) -> str:
+            if not self.is_recording:
+                return ""
+            self.is_recording = False
+            self._stop_event.set()
+            if self._thread:
+                self._thread.join(timeout=3.0)
+                self._thread = None
+            if self._proc:
+                try:
+                    if self._proc.stdin:
+                        self._proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self._proc.wait(timeout=4.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                self._proc = None
+
+            print(f"[*] Stopped recording. Frames written: {self.frames_written}, dropped: {self.frames_dropped}. Saved to {self.output_path}")
+            return self.output_path
+
     class EmbeddedVideoCanvas(QWidget):
         """Zero-latency embedded live video canvas for EverLive Console Hub.
 
@@ -3025,6 +3207,7 @@ if HAS_QT:
         def __init__(self, parent=None, duo_mode: bool = False):
             super().__init__(parent)
             self.duo_mode = duo_mode
+            self.recorder: Optional[StreamRecorder] = None
             self.port = 0
             self.aspect = "auto"
             self.scale_mode = "fit"
@@ -3215,6 +3398,8 @@ if HAS_QT:
                 if post_seq != seq:
                     return
 
+                if getattr(self, "recorder", None) is not None and self.recorder.is_recording:
+                    self.recorder.push_frame(bytes(yuy2_slice), width, height)
 
                 rgb_len = width * height * 3
                 if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_len:
@@ -3483,6 +3668,25 @@ if HAS_QT:
 
             h_hud_top.addStretch(1)
 
+            # Frame Generation (LSFG) Button in Fullscreen OSD
+            self.btn_framegen = QPushButton("Frame Generation (LSFG): Off")
+            self.btn_framegen.setFocusPolicy(Qt.NoFocus)
+            self.btn_framegen.setCursor(Qt.PointingHandCursor)
+            self.btn_framegen.setStyleSheet(
+                "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-size: 11px;")
+            self.btn_framegen.setToolTip("Toggle Frame Generation (LSFG) (Off ⇄ 60→120 ⇄ 30→60) - Hotkey: G")
+            self.btn_framegen.clicked.connect(self.main_window.toggle_framegen_quick)
+            h_hud_top.addWidget(self.btn_framegen)
+
+            # Record Feed Button in Fullscreen OSD
+            self.btn_record = QPushButton("Record Feed")
+            self.btn_record.setFocusPolicy(Qt.NoFocus)
+            self.btn_record.setCursor(Qt.PointingHandCursor)
+            self.btn_record.setStyleSheet(
+                "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-size: 11px;")
+            self.btn_record.setToolTip("Record the live HDMI capture feed directly to an MP4 video file - Hotkey: R")
+            self.btn_record.clicked.connect(self.main_window.toggle_recording)
+            h_hud_top.addWidget(self.btn_record)
 
             # Migrated action buttons directly in the top HUD
             self.btn_aspect = QPushButton("Aspect: AUTO (A)")
@@ -3534,7 +3738,50 @@ if HAS_QT:
             self._show_osd(user_initiated=False)
 
         def _sync_controls_state(self):
-            pass
+            mode = getattr(self.main_window, "saved_cfg", {}).get("framegen_mode", "off")
+            if hasattr(self.main_window, "combo_framegen"):
+                mode = self.main_window.combo_framegen.currentData() or mode
+            self.update_framegen_visual(mode)
+
+            rec = getattr(self.main_window, "recorder", None)
+            is_recording = bool(rec and rec.is_recording)
+            sec = int(rec.duration()) if is_recording else 0
+            self.update_record_visual(is_recording, sec)
+
+        def update_framegen_visual(self, mode: str):
+            if not hasattr(self, "btn_framegen"):
+                return
+            if mode == "60to120":
+                self.btn_framegen.setText("Frame Generation (LSFG): 60 → 120 FPS")
+                self.btn_framegen.setStyleSheet(
+                    "background: #132a22; color: #6ee7b7; border: 1px solid #10b981; padding: 3px 9px; border-radius: 4px; font-weight: bold; font-size: 11px;"
+                )
+            elif mode == "30to60":
+                self.btn_framegen.setText("Frame Generation (LSFG): 30 → 60 FPS")
+                self.btn_framegen.setStyleSheet(
+                    "background: #192538; color: #93c5fd; border: 1px solid #3b82f6; padding: 3px 9px; border-radius: 4px; font-weight: bold; font-size: 11px;"
+                )
+            else:
+                self.btn_framegen.setText("Frame Generation (LSFG): Off")
+                self.btn_framegen.setStyleSheet(
+                    "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-size: 11px;"
+                )
+
+        def update_record_visual(self, is_recording: bool, elapsed_sec: int = 0):
+            if not hasattr(self, "btn_record"):
+                return
+            if is_recording:
+                mins = elapsed_sec // 60
+                secs = elapsed_sec % 60
+                self.btn_record.setText(f"Stop Recording ({mins:02d}:{secs:02d})")
+                self.btn_record.setStyleSheet(
+                    "background: #7f1d1d; color: #fecaca; border: 1px solid #ef4444; padding: 3px 9px; border-radius: 4px; font-weight: bold; font-size: 11px;"
+                )
+            else:
+                self.btn_record.setText("Record Feed")
+                self.btn_record.setStyleSheet(
+                    "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-size: 11px;"
+                )
 
         def _update_hud_telemetry(self):
             self._sync_controls_state()
@@ -3640,6 +3887,12 @@ if HAS_QT:
             elif key == Qt.Key_A:
                 self._cycle_aspect()
                 event.accept()
+            elif key == Qt.Key_G:
+                self.main_window.toggle_framegen_quick()
+                event.accept()
+            elif key == Qt.Key_R:
+                self.main_window.toggle_recording()
+                event.accept()
             else:
                 super().keyPressEvent(event)
 
@@ -3739,6 +3992,10 @@ if HAS_QT:
             if not self.vfio_mode and self.saved_cfg.get("engine", "native") == "mpv":
                 self.streamer.force_mpv = True
 
+            self.recorder = StreamRecorder()
+            self.record_timer = QTimer(self)
+            self.record_timer.setInterval(1000)
+            self.record_timer.timeout.connect(self._on_record_timer_tick)
 
             self._fullscreen_window = None
             self.init_ui()
@@ -4573,6 +4830,7 @@ if HAS_QT:
             # Embedded Live Video Feed Canvas (directly in layout, no enclosing container background)
             self.video_canvas = EmbeddedVideoCanvas(self, duo_mode=self.duo_mode)
             self.video_canvas.setStyleSheet("background-color: transparent;")
+            self.video_canvas.recorder = self.recorder
             self.canvas = self.video_canvas
             saved_input = load_settings().get("duo_input", 0)
             self.video_canvas.set_port(saved_input)
@@ -4821,6 +5079,23 @@ if HAS_QT:
             v_side.addWidget(self.btn_resync)
             v_side.addSpacing(6)
 
+            self.btn_framegen = QPushButton("Frame Generation (LSFG): Off")
+            self.btn_framegen.setObjectName("btnGhost")
+            self.btn_framegen.setFixedHeight(32)
+            self.btn_framegen.setCursor(Qt.PointingHandCursor)
+            self.btn_framegen.setToolTip("Toggle Frame Generation (LSFG) (Off ⇄ 60→120 FPS ⇄ 30→60 FPS dedup)")
+            self.btn_framegen.clicked.connect(self.toggle_framegen_quick)
+            v_side.addWidget(self.btn_framegen)
+            v_side.addSpacing(6)
+
+            self.btn_record = QPushButton("Record Feed")
+            self.btn_record.setObjectName("btnGhost")
+            self.btn_record.setFixedHeight(32)
+            self.btn_record.setCursor(Qt.PointingHandCursor)
+            self.btn_record.setToolTip("Record the live HDMI capture feed directly to an MP4 video file in ~/Videos")
+            self.btn_record.clicked.connect(self.toggle_recording)
+            v_side.addWidget(self.btn_record)
+            v_side.addSpacing(6)
 
             # Expandable Advanced Menu toggle under Quick Controls
             self.btn_advanced = QPushButton("Advanced Settings  ▾" if self.is_advanced_mode else "Advanced Settings  ▸")
@@ -6364,6 +6639,108 @@ if HAS_QT:
             if getattr(self, "_fullscreen_window", None) is not None:
                 try:
                     self._fullscreen_window.update_framegen_visual(mode)
+                except Exception:
+                    pass
+
+        def toggle_framegen_quick(self):
+            current = self.saved_cfg.get("framegen_mode", "off")
+            if hasattr(self, "combo_framegen"):
+                current = self.combo_framegen.currentData() or current
+            if current == "off":
+                next_mode = "60to120"
+            elif current == "60to120":
+                next_mode = "30to60"
+            else:
+                next_mode = "off"
+
+            if hasattr(self, "combo_framegen"):
+                idx = self.combo_framegen.findData(next_mode)
+                if idx >= 0:
+                    self.combo_framegen.setCurrentIndex(idx)
+                else:
+                    self.saved_cfg["framegen_mode"] = next_mode
+                    save_settings({"framegen_mode": next_mode})
+                    self._update_framegen_button(next_mode)
+            else:
+                self.saved_cfg["framegen_mode"] = next_mode
+                save_settings({"framegen_mode": next_mode})
+                self._update_framegen_button(next_mode)
+                if self._ipc is not None and self._ipc.connected:
+                    self._ipc.set_framegen(
+                        next_mode,
+                        float(self.saved_cfg.get("fg_flow_scale", 1.0)),
+                        bool(self.saved_cfg.get("fg_perf_mode", False)),
+                        bool(self.saved_cfg.get("fg_low_latency", True)),
+                    )
+
+            mode_labels = {
+                "off": "Frame Generation (LSFG): Off",
+                "60to120": "Frame Generation (LSFG): 60 → 120 FPS (2x)",
+                "30to60": "Frame Generation (LSFG): 30 → 60 FPS (PS5 Dedup)",
+            }
+            self.show_toast(mode_labels.get(next_mode, f"Frame Generation (LSFG): {next_mode}"), duration=2.5)
+
+        def toggle_recording(self):
+            if not hasattr(self, "recorder"):
+                return
+            if self.recorder.is_recording:
+                saved_path = self.recorder.stop()
+                if hasattr(self, "record_timer"):
+                    self.record_timer.stop()
+                if hasattr(self, "btn_record"):
+                    self.btn_record.setText("Record Feed")
+                    self.btn_record.setStyleSheet("")
+                    self.btn_record.setToolTip("Record the live HDMI capture feed directly to an MP4 video file in ~/Videos")
+                if getattr(self, "_fullscreen_window", None) is not None:
+                    try:
+                        self._fullscreen_window.update_record_visual(False)
+                    except Exception:
+                        pass
+                if saved_path:
+                    fname = os.path.basename(saved_path)
+                    self.show_toast(f"Recording saved: {fname}", duration=4.0)
+            else:
+                canvas = getattr(self, "video_canvas", None) or getattr(self, "canvas", None)
+                if not canvas or not getattr(canvas, "has_signal", False):
+                    self.show_toast("Cannot record: Waiting for HDMI signal", duration=3.0)
+                    return
+
+                w = getattr(canvas, "current_width", 1920) or 1920
+                h = getattr(canvas, "current_height", 1080) or 1080
+                fps = 60
+                ok, res = self.recorder.start(width=w, height=h, fps=fps)
+                if not ok:
+                    self.show_toast(f"Record failed: {res}", duration=4.0)
+                    return
+
+                if hasattr(self, "btn_record"):
+                    self.btn_record.setText("Stop Recording (00:00)")
+                    self.btn_record.setStyleSheet(
+                        "background-color: #7f1d1d; color: #fecaca; border: 1px solid #ef4444; font-weight: 600; border-radius: 6px;"
+                    )
+                    self.btn_record.setToolTip("Recording in progress. Click to finish and save the MP4 video.")
+                if getattr(self, "_fullscreen_window", None) is not None:
+                    try:
+                        self._fullscreen_window.update_record_visual(True, 0)
+                    except Exception:
+                        pass
+                if hasattr(self, "record_timer"):
+                    self.record_timer.start()
+                self.show_toast("Recording started", duration=2.5)
+
+        def _on_record_timer_tick(self):
+            if not hasattr(self, "recorder") or not self.recorder.is_recording:
+                if hasattr(self, "record_timer"):
+                    self.record_timer.stop()
+                return
+            sec = int(self.recorder.duration())
+            mins = sec // 60
+            secs = sec % 60
+            if hasattr(self, "btn_record"):
+                self.btn_record.setText(f"Stop Recording ({mins:02d}:{secs:02d})")
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.update_record_visual(True, sec)
                 except Exception:
                     pass
 
