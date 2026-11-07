@@ -44,6 +44,11 @@ tests/test_edid
 tests/test_config
 tools/opengc573-userd/gc573_framegen_selftest
 
+# Packaging build artifacts
+packaging/AppImage/everlive.AppDir/
+packaging/dist/
+packaging/appimagetool*
+
 # Raw uncompressed video dumps
 20261010_131220.mp4
 *.mkv

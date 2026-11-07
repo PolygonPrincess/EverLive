@@ -1,0 +1,37 @@
+#!/bin/bash
+# EverLive AppImage Entry Point (AppRun)
+set -e
+
+# Resolve the directory where the AppImage is mounted
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+export APPDIR
+export PATH="${APPDIR}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+export PYTHONPATH="${APPDIR}/usr/lib/everlive:${PYTHONPATH}"
+export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Ensure shared memory directory exists
+mkdir -p /dev/shm 2>/dev/null || true
+
+# Check VFIO access permission
+if [ -e "/dev/vfio/vfio" ] && [ ! -r "/dev/vfio/vfio" ]; then
+    echo "[EverLive] Note: /dev/vfio/vfio is not readable by user $(whoami)."
+    echo "[EverLive] Run 'sudo usermod -aG video,audio $(whoami)' and log back in, or run with appropriate permissions."
+fi
+
+# If an explicit executable argument is passed, run that; otherwise default to everlive_viewer
+if [ "$#" -gt 0 ] && [ -x "${APPDIR}/usr/bin/$1" ]; then
+    EXEC_TARGET="${APPDIR}/usr/bin/$1"
+    shift
+    exec "${EXEC_TARGET}" "$@"
+fi
+
+if [ -f "${APPDIR}/usr/lib/everlive/everlive_viewer.py" ]; then
+    exec python3 "${APPDIR}/usr/lib/everlive/everlive_viewer.py" "$@"
+elif [ -x "${APPDIR}/usr/bin/gc573_user_streamer" ]; then
+    exec "${APPDIR}/usr/bin/gc573_user_streamer" "$@"
+else
+    echo "[EverLive] Error: Failed to find valid application payload in AppDir."
+    exit 1
+fi
