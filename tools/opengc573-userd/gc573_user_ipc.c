@@ -116,10 +116,7 @@ bool gc573_ipc_poll_cmd(struct gc573_ipc_cmd *out)
 
 static uint64_t ipc_now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000U + (uint64_t)(ts.tv_nsec / 1000000L);
+	return gc573_now_ms();
 }
 
 /* JSON parsing with jsmn - limits: 128 tokens, max depth 16, max input 16KB */
