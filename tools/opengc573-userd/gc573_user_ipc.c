@@ -582,7 +582,9 @@ static void ipc_send_hello(struct ipc_server *s, struct ipc_client *c,
 		     "\"led.set\",\"led.mode.set\",\"audio.volume.set\","
 		     "\"audio.mute.set\",\"osd.set\",\"osd.position.set\","
 		     "\"aspect.set\",\"mode.set\",\"v4l2.set\","
-		     "\"hdr.set\",\"hdr.passthrough\",\"scale.set\",\"framegen.set\",\"toast.show\"]}",
+		     "\"hdr.set\",\"hdr.passthrough\",\"hdr.exposure\","
+		     "\"scale.set\",\"framegen.set\",\"toast.show\","
+		     "\"edid.set\",\"hotplug\"]}",
 		     GC573_IPC_PROTO_VERSION, s->version, (long)getpid(),
 		     path_esc);
 	if (n > 0 && (size_t)n < sizeof(result))
@@ -969,6 +971,63 @@ static void ipc_handle_v4l2(struct ipc_client *c, const char *id,
 	ipc_push_and_reply(c, id, &cmd);
 }
 
+static void ipc_handle_edid_set(struct ipc_client *c, const char *id,
+				const char *line)
+{
+	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_EDID };
+	char name[64];
+
+	if (!json_get_string(line, "profile", name, sizeof(name)) &&
+	    !json_get_string(line, "name", name, sizeof(name))) {
+		ipc_error(c, id, -32602, "invalid params: profile required");
+		return;
+	}
+	if (!name[0]) {
+		ipc_error(c, id, -32602, "invalid params: empty profile");
+		return;
+	}
+
+	snprintf(cmd.path, sizeof(cmd.path), "%s", name);
+	ipc_push_and_reply(c, id, &cmd);
+}
+
+static void ipc_handle_hotplug(struct ipc_client *c, const char *id,
+			       const char *line)
+{
+	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_HOTPLUG };
+	bool pulse = true;
+	char action[16];
+
+	if (json_get_bool(line, "pulse", &pulse))
+		cmd.a = pulse ? 1 : 0;
+	if (json_get_string(line, "action", action, sizeof(action)))
+		cmd.a = (strcasecmp(action, "off") != 0 &&
+			 strcasecmp(action, "disable") != 0 &&
+			 strcasecmp(action, "0") != 0);
+
+	ipc_push_and_reply(c, id, &cmd);
+}
+
+static void ipc_handle_hdr_exposure(struct ipc_client *c, const char *id,
+				    const char *line)
+{
+	struct gc573_ipc_cmd cmd = { .kind = GC573_IPC_CMD_HDR_EV };
+	double exposure = 0.0;
+
+	if (!json_get_double(line, "exposure", &exposure) &&
+	    !json_get_double(line, "ev", &exposure)) {
+		ipc_error(c, id, -32602, "invalid params: exposure required");
+		return;
+	}
+
+	if (exposure < -2.0)
+		exposure = -2.0;
+	if (exposure > 2.0)
+		exposure = 2.0;
+	cmd.f = (float)exposure;
+	ipc_push_and_reply(c, id, &cmd);
+}
+
 static void ipc_handle_toast_show(struct ipc_client *c, const char *id,
 				   const char *line)
 {
@@ -1028,6 +1087,12 @@ static void ipc_handle_line(struct ipc_server *s, struct ipc_client *c,
 		ipc_handle_hdr(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "hdr.passthrough") == 0) {
 		ipc_handle_hdr_passthrough(c, has_id ? id : NULL, line);
+	} else if (strcmp(method, "hdr.exposure") == 0) {
+		ipc_handle_hdr_exposure(c, has_id ? id : NULL, line);
+	} else if (strcmp(method, "edid.set") == 0) {
+		ipc_handle_edid_set(c, has_id ? id : NULL, line);
+	} else if (strcmp(method, "hotplug") == 0) {
+		ipc_handle_hotplug(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "scale.set") == 0) {
 		ipc_handle_scale(c, has_id ? id : NULL, line);
 	} else if (strcmp(method, "framegen.set") == 0) {

@@ -170,6 +170,24 @@ struct everlive_device {
 /* Returns a pointer to the static registry table and sets out_count */
 const struct everlive_device_desc *everlive_get_card_registry(size_t *out_count);
 
+/*
+ * Bind a backend implementation to every registry entry with @model_slug.
+ * Backends own their hardware context; the core only stores the vtable.
+ * Returns 0, -EINVAL for bad arguments, -ENOENT for an unknown model, or
+ * -ENOSPC when the binding table is full.
+ */
+int everlive_register_card_ops(const char *model_slug,
+			       const struct everlive_card_ops *ops);
+
+/*
+ * Resolve the active operations for a descriptor.  This returns the most
+ * recently registered backend vtable, the descriptor's built-in vtable, or
+ * the core default (which reports -ENOTSUP for hardware actions) in that
+ * order, and never NULL.
+ */
+const struct everlive_card_ops *
+everlive_card_ops_for(const struct everlive_device_desc *desc);
+
 /* Matches vendor, device, and subsystem IDs to a registered card descriptor */
 const struct everlive_device_desc *everlive_match_card(uint16_t vendor,
 						       uint16_t device,

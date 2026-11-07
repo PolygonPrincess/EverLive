@@ -81,6 +81,64 @@ static pthread_mutex_t g_v4l2_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_open_handle_count = 0;
 static struct gc573_shm_region *g_shm_ptr = NULL;
 
+/*
+ * Optional per-process opt-in.  Set EVERLIVE_V4L2_TARGET to a comma-separated
+ * list of executable basenames (or "*") to keep this shim dormant in children
+ * that inherit LD_PRELOAD.  Unset preserves the legacy global behaviour.
+ */
+static int g_target_allowed = -1;
+
+static bool shim_target_allowed(void)
+{
+	int cached = __atomic_load_n(&g_target_allowed, __ATOMIC_RELAXED);
+	if (cached >= 0)
+		return cached != 0;
+
+	const char *list = getenv("EVERLIVE_V4L2_TARGET");
+	if (!list || !*list) {
+		__atomic_store_n(&g_target_allowed, 1, __ATOMIC_RELAXED);
+		return true;
+	}
+
+	const char *prog = program_invocation_short_name;
+	bool match = false;
+	const char *p = list;
+
+	if (!prog)
+		prog = "";
+	while (*p) {
+		const char *start;
+
+		while (*p == ',' || *p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		start = p;
+		while (*p && *p != ',' && *p != ' ' && *p != '\t')
+			p++;
+		if ((size_t)(p - start) == 1 && start[0] == '*') {
+			match = true;
+			break;
+		}
+		if ((size_t)(p - start) == strlen(prog) &&
+		    strncmp(start, prog, (size_t)(p - start)) == 0) {
+			match = true;
+			break;
+		}
+	}
+
+	__atomic_store_n(&g_target_allowed, match ? 1 : 0, __ATOMIC_RELAXED);
+	return match;
+}
+
+static uint64_t shim_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* Real libc & libv4l2 function pointers */
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_open64)(const char *, int, ...) = NULL;
@@ -366,6 +424,17 @@ static void shm_convert_frame(uint8_t *dst, size_t dst_max,
 		return;
 	}
 
+	/* Stale publisher (crash/SIGKILL): emit black instead of a frozen frame. */
+	{
+		uint64_t heartbeat = __atomic_load_n(&shm->heartbeat_ns,
+						     __ATOMIC_ACQUIRE);
+		if (heartbeat && shim_now_ns() > heartbeat + 1000000000ULL) {
+			convert_yuy2_frame(NULL, 0, 0, dst, dst_max,
+					   dst_w, dst_h, pixfmt);
+			return;
+		}
+	}
+
 	for (int tries = 0; tries < 8; tries++) {
 		seq = __atomic_load_n(&shm->port.seq, __ATOMIC_ACQUIRE);
 		if (!seq || (seq & 1)) {
@@ -391,7 +460,7 @@ static void shm_convert_frame(uint8_t *dst, size_t dst_max,
 
 static int match_virtual_video_path(const char *path)
 {
-	if (!path)
+	if (!path || !shim_target_allowed())
 		return -1;
 	const char *env_dev = getenv("EVERLIVE_V4L2_DEVICE");
 	if (env_dev && strcmp(path, env_dev) == 0)
@@ -427,7 +496,7 @@ static struct gc573_dir_track *find_dir_track(DIR *dirp)
 
 static int match_virtual_sysfs_stat(const char *path, struct stat *st)
 {
-	if (!path)
+	if (!path || !shim_target_allowed())
 		return -1;
 	while (*path == '.' && *(path + 1) == '/')
 		path += 2;
@@ -465,6 +534,8 @@ static int match_virtual_sysfs_stat(const char *path, struct stat *st)
 
 static int open_virtual_sysfs(const char *path)
 {
+	if (!shim_target_allowed())
+		return -1;
 	if (strncmp(path, "/sys/class/video4linux/video63/", 31) != 0)
 		return -1;
 	const char *attr = path + 31;

@@ -11,8 +11,117 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <limits.h>
+#include <errno.h>
 
 #define DEFAULT_PCI_SYSFS_PATH "/sys/bus/pci/devices"
+
+/* -------------------------------------------------------------------------
+ * Default Hardware Operations
+ *
+ * The core library owns discovery and the control-plane contract; a concrete
+ * backend (the GC573 streamer or the GC570D daemon) registers its vtable with
+ * everlive_register_card_ops().  Until then these defaults keep the interface
+ * well defined: probe() verifies the discovered identity, release() is a
+ * no-op because the core owns no hardware handles, and every operation that
+ * would touch real hardware reports -ENOTSUP instead of pretending success.
+ * ------------------------------------------------------------------------- */
+static int everlive_default_probe(struct everlive_device *dev)
+{
+	if (!dev || !dev->desc)
+		return -EINVAL;
+	if (!dev->pci_bdf[0])
+		return -EINVAL;
+	return 0;
+}
+
+static int everlive_default_unsupported(struct everlive_device *dev)
+{
+	(void)dev;
+	return -ENOTSUP;
+}
+
+static int everlive_default_set_led(struct everlive_device *dev,
+				    enum everlive_led_mode mode,
+				    uint8_t r, uint8_t g, uint8_t b)
+{
+	(void)dev;
+	(void)mode;
+	(void)r;
+	(void)g;
+	(void)b;
+	return -ENOTSUP;
+}
+
+static int everlive_default_set_input_port(struct everlive_device *dev, int port)
+{
+	(void)dev;
+	(void)port;
+	return -ENOTSUP;
+}
+
+static int everlive_default_set_edid_profile(struct everlive_device *dev,
+					     int port,
+					     const char *profile_name,
+					     const uint8_t *custom_bin,
+					     size_t bin_len)
+{
+	(void)dev;
+	(void)port;
+	(void)profile_name;
+	(void)custom_bin;
+	(void)bin_len;
+	return -ENOTSUP;
+}
+
+static int everlive_default_enable_passthrough(struct everlive_device *dev,
+					       bool enable)
+{
+	(void)dev;
+	(void)enable;
+	return -ENOTSUP;
+}
+
+static int everlive_default_get_telemetry(struct everlive_device *dev,
+					  struct everlive_telemetry *out)
+{
+	(void)dev;
+	if (out)
+		memset(out, 0, sizeof(*out));
+	return -ENOTSUP;
+}
+
+static void everlive_default_release(struct everlive_device *dev)
+{
+	(void)dev;
+}
+
+static const struct everlive_card_ops kEverliveDefaultOps = {
+	.probe = everlive_default_probe,
+	.init_hardware = everlive_default_unsupported,
+	.standby = everlive_default_unsupported,
+	.release = everlive_default_release,
+	.set_input_port = everlive_default_set_input_port,
+	.start_capture = everlive_default_unsupported,
+	.stop_capture = everlive_default_unsupported,
+	.set_edid_profile = everlive_default_set_edid_profile,
+	.enable_passthrough = everlive_default_enable_passthrough,
+	.set_led = everlive_default_set_led,
+	.get_telemetry = everlive_default_get_telemetry,
+};
+
+/*
+ * Backend registration table.  Discovery descriptors are immutable, so a
+ * backend binds by model slug instead of mutating the static registry.
+ */
+#define EVERLIVE_MAX_OPS_BINDINGS 8
+
+struct everlive_ops_binding {
+	const char *model_slug;
+	const struct everlive_card_ops *ops;
+};
+
+static struct everlive_ops_binding kEverliveOpsBindings[EVERLIVE_MAX_OPS_BINDINGS];
+static size_t kEverliveOpsBindingCount;
 
 /* -------------------------------------------------------------------------
  * Static Hardware Registry of Supported Capture Cards
@@ -32,7 +141,7 @@ static const struct everlive_device_desc kEverliveCardRegistry[] = {
 				EVERLIVE_CAP_HARDWARE_SPLITTER |
 				EVERLIVE_CAP_EDID_PASSTHROUGH,
 		.num_input_ports = 2,
-		.ops = NULL, /* Bound dynamically at initialization */
+		.ops = &kEverliveDefaultOps,
 	},
 	{
 		.vendor_id = 0x1461,
@@ -52,7 +161,7 @@ static const struct everlive_device_desc kEverliveCardRegistry[] = {
 				EVERLIVE_CAP_FRAMEGEN |
 				EVERLIVE_CAP_EDID_PASSTHROUGH,
 		.num_input_ports = 1,
-		.ops = NULL,
+		.ops = &kEverliveDefaultOps,
 	},
 	{
 		.vendor_id = 0x1461,
@@ -72,7 +181,7 @@ static const struct everlive_device_desc kEverliveCardRegistry[] = {
 				EVERLIVE_CAP_FRAMEGEN |
 				EVERLIVE_CAP_EDID_PASSTHROUGH,
 		.num_input_ports = 1,
-		.ops = NULL,
+		.ops = &kEverliveDefaultOps,
 	},
 	{
 		.vendor_id = 0x1461,
@@ -90,7 +199,7 @@ static const struct everlive_device_desc kEverliveCardRegistry[] = {
 				EVERLIVE_CAP_BITSTREAM_AUDIO |
 				EVERLIVE_CAP_EDID_PASSTHROUGH,
 		.num_input_ports = 1,
-		.ops = NULL,
+		.ops = &kEverliveDefaultOps,
 	},
 };
 
@@ -101,6 +210,57 @@ const struct everlive_device_desc *everlive_get_card_registry(size_t *out_count)
 	if (out_count)
 		*out_count = REGISTRY_COUNT;
 	return kEverliveCardRegistry;
+}
+
+int everlive_register_card_ops(const char *model_slug,
+			       const struct everlive_card_ops *ops)
+{
+	const struct everlive_device_desc *canonical = NULL;
+
+	if (!model_slug || !*model_slug || !ops)
+		return -EINVAL;
+
+	for (size_t i = 0; i < REGISTRY_COUNT; i++) {
+		if (strcmp(kEverliveCardRegistry[i].model_slug, model_slug) == 0) {
+			canonical = &kEverliveCardRegistry[i];
+			break;
+		}
+	}
+	if (!canonical)
+		return -ENOENT;
+
+	/* Replace an existing binding for the same model. */
+	for (size_t i = 0; i < kEverliveOpsBindingCount; i++) {
+		if (kEverliveOpsBindings[i].model_slug == canonical->model_slug) {
+			kEverliveOpsBindings[i].ops = ops;
+			return 0;
+		}
+	}
+
+	if (kEverliveOpsBindingCount >= EVERLIVE_MAX_OPS_BINDINGS)
+		return -ENOSPC;
+
+	kEverliveOpsBindings[kEverliveOpsBindingCount].model_slug =
+		canonical->model_slug;
+	kEverliveOpsBindings[kEverliveOpsBindingCount].ops = ops;
+	kEverliveOpsBindingCount++;
+	return 0;
+}
+
+const struct everlive_card_ops *
+everlive_card_ops_for(const struct everlive_device_desc *desc)
+{
+	if (!desc)
+		return &kEverliveDefaultOps;
+
+	for (size_t i = 0; i < kEverliveOpsBindingCount; i++) {
+		if (kEverliveOpsBindings[i].model_slug == desc->model_slug ||
+		    strcmp(kEverliveOpsBindings[i].model_slug,
+			   desc->model_slug) == 0)
+			return kEverliveOpsBindings[i].ops;
+	}
+
+	return desc->ops ? desc->ops : &kEverliveDefaultOps;
 }
 
 const struct everlive_device_desc *everlive_match_card(uint16_t vendor,

@@ -73,6 +73,19 @@ static void print_usage(const char *prog)
 	       "  detect                  List all installed capture cards and capabilities\n"
 	       "  list-models             Display all supported card models in EverLive registry\n"
 	       "  status                  Display capture daemon status and active hardware\n\n"
+	       "Runtime control (JSON-RPC to the running engine):\n"
+	       "  runtime status          Engine status (signal, audio, V4L2, HDR...)\n"
+	       "  runtime led <RRGGBB|off>\n"
+	       "  runtime led-mode <static|wave|rainbow|off>\n"
+	       "  runtime edid <profile|/path.edid>\n"
+	       "  runtime hdr <auto|off|passthrough>\n"
+	       "  runtime hdr-ev <-2.0..2.0>\n"
+	       "  runtime hdr-passthrough <0|1>\n"
+	       "  runtime hotplug         Pulse HDMI HPD and replay the EDID\n"
+	       "  runtime toast <text>\n"
+	       "  runtime volume <0..150>\n"
+	       "  runtime mute <0|1>\n"
+	       "  runtime osd <0|1>\n\n"
 	       "Service & Bringup:\n"
 	       "  init                    Initialize capture card in background (passthrough/audio)\n"
 	       "  service status          Show systemd user service status\n"
@@ -192,6 +205,313 @@ static int cmd_list_models(void)
 	return 0;
 }
 
+static int ctl_resolve_socket(char *buf, size_t size)
+{
+	const char *override = getenv("EVERLIVE_CONTROL_SOCKET");
+	const char *xdg = getenv("XDG_RUNTIME_DIR");
+	uid_t uid = getuid();
+	int n;
+
+	if (override && *override) {
+		n = snprintf(buf, size, "%s", override);
+		return (n > 0 && (size_t)n < size) ? 0 : -1;
+	}
+
+	if (xdg && *xdg) {
+		n = snprintf(buf, size, "%s/everlive-experimental.sock", xdg);
+		if (n > 0 && (size_t)n < size && access(buf, F_OK) == 0)
+			return 0;
+	}
+
+	n = snprintf(buf, size, "/run/user/%u/everlive-experimental.sock",
+		     (unsigned int)uid);
+	if (n > 0 && (size_t)n < size && access(buf, F_OK) == 0)
+		return 0;
+
+	n = snprintf(buf, size, "/tmp/everlive-%u/everlive-experimental.sock",
+		     (unsigned int)uid);
+	return (n > 0 && (size_t)n < size) ? 0 : -1;
+}
+
+static void json_escape(const char *in, char *out, size_t out_size)
+{
+	size_t o = 0;
+
+	for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+		if (o + 8 >= out_size)
+			break;
+		switch (*p) {
+		case '"':
+			out[o++] = '\\';
+			out[o++] = '"';
+			break;
+		case '\\':
+			out[o++] = '\\';
+			out[o++] = '\\';
+			break;
+		case '\n':
+			out[o++] = '\\';
+			out[o++] = 'n';
+			break;
+		case '\r':
+			out[o++] = '\\';
+			out[o++] = 'r';
+			break;
+		case '\t':
+			out[o++] = '\\';
+			out[o++] = 't';
+			break;
+		default:
+			if (*p < 0x20)
+				o += (size_t)snprintf(out + o, out_size - o,
+						      "\\u%04x", *p);
+			else
+				out[o++] = (char)*p;
+			break;
+		}
+	}
+	out[o] = '\0';
+}
+
+static int ctl_call(const char *method, const char *params)
+{
+	char path[108];
+	struct sockaddr_un addr;
+	char request[2048];
+	char response[8192];
+	size_t off = 0;
+	int fd;
+
+	if (ctl_resolve_socket(path, sizeof(path)) < 0) {
+		fprintf(stderr, "EverLive control socket path is too long\n");
+		return 1;
+	}
+
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		fprintf(stderr, "socket: %s\n", strerror(errno));
+		return 1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr,
+			"Cannot connect to the EverLive engine at %s: %s\n"
+			"Is the capture engine running?\n",
+			path, strerror(errno));
+		close(fd);
+		return 1;
+	}
+
+	snprintf(request, sizeof(request),
+		 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}\n",
+		 method, params && *params ? params : "{}");
+
+	while (off < strlen(request)) {
+		ssize_t n = write(fd, request + off, strlen(request) - off);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "write: %s\n", strerror(errno));
+			close(fd);
+			return 1;
+		}
+		off += (size_t)n;
+	}
+
+	off = 0;
+	for (;;) {
+		ssize_t n;
+
+		if (off + 1 >= sizeof(response)) {
+			fprintf(stderr, "Response too large\n");
+			close(fd);
+			return 1;
+		}
+		n = read(fd, response + off, sizeof(response) - off - 1);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "read: %s\n", strerror(errno));
+			close(fd);
+			return 1;
+		}
+		if (n == 0)
+			break;
+		off += (size_t)n;
+		if (memchr(response, '\n', off))
+			break;
+	}
+	close(fd);
+
+	response[off] = '\0';
+	while (off > 0 && (response[off - 1] == '\n' || response[off - 1] == '\r'))
+		response[--off] = '\0';
+
+	printf("%s\n", response);
+	return strstr(response, "\"error\"") ? 1 : 0;
+}
+
+static int parse_switch(const char *value)
+{
+	if (!value)
+		return -1;
+	if (!strcasecmp(value, "on") || !strcasecmp(value, "true") ||
+	    !strcasecmp(value, "1") || !strcasecmp(value, "yes") ||
+	    !strcasecmp(value, "enable") || !strcasecmp(value, "enabled"))
+		return 1;
+	if (!strcasecmp(value, "off") || !strcasecmp(value, "false") ||
+	    !strcasecmp(value, "0") || !strcasecmp(value, "no") ||
+	    !strcasecmp(value, "disable") || !strcasecmp(value, "disabled"))
+		return 0;
+	return -1;
+}
+
+static int cmd_runtime(int argc, char **argv)
+{
+	char params[1536];
+	char escaped[512];
+
+	if (argc < 3) {
+		fprintf(stderr, "Usage: everlive-ctl runtime <topic> [value]\n"
+			"  status                     Show the engine JSON status\n"
+			"  led <RRGGBB|off>           Set the static LED colour\n"
+			"  led-mode <static|wave|rainbow|off>\n"
+			"  edid <default|1440p120|1080p240|bitstream|/path.edid>\n"
+			"  hdr <auto|off|passthrough> Toggle HDR processing\n"
+			"  hdr-ev <-2.0..2.0>         Set tonemap exposure in EV\n"
+			"  hdr-passthrough <0|1>      Toggle BT.2020 HDR passthrough\n"
+			"  hotplug                    Pulse HDMI HPD / replay EDID\n"
+			"  toast <text>               Show an on-screen notification\n"
+			"  volume <0..150>            Set desktop audio volume %%\n"
+			"  mute <0|1>                 Mute/unmute desktop audio\n"
+			"  osd <0|1>                  Toggle the on-screen overlay\n");
+		return 1;
+	}
+
+	const char *topic = argv[2];
+
+	if (strcmp(topic, "status") == 0)
+		return ctl_call("status.get", "{}");
+
+	if (strcmp(topic, "led") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime led needs RRGGBB or off\n");
+			return 1;
+		}
+		if (strcasecmp(argv[3], "off") == 0)
+			return ctl_call("led.mode.set", "{\"mode\":\"off\"}");
+		unsigned long rgb = strtoul(argv[3], NULL, 16);
+		snprintf(params, sizeof(params),
+			 "{\"r\":%lu,\"g\":%lu,\"b\":%lu}",
+			 (rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+		return ctl_call("led.set", params);
+	}
+
+	if (strcmp(topic, "led-mode") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime led-mode needs static|wave|rainbow|off\n");
+			return 1;
+		}
+		json_escape(argv[3], escaped, sizeof(escaped));
+		snprintf(params, sizeof(params), "{\"mode\":\"%s\"}", escaped);
+		return ctl_call("led.mode.set", params);
+	}
+
+	if (strcmp(topic, "edid") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime edid needs a profile name or path\n");
+			return 1;
+		}
+		json_escape(argv[3], escaped, sizeof(escaped));
+		snprintf(params, sizeof(params), "{\"profile\":\"%s\"}", escaped);
+		return ctl_call("edid.set", params);
+	}
+
+	if (strcmp(topic, "hdr") == 0) {
+		const char *mode = argc >= 4 ? argv[3] : "auto";
+
+		json_escape(mode, escaped, sizeof(escaped));
+		snprintf(params, sizeof(params), "{\"mode\":\"%s\"}", escaped);
+		return ctl_call("hdr.set", params);
+	}
+
+	if (strcmp(topic, "hdr-ev") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime hdr-ev needs an EV value\n");
+			return 1;
+		}
+		snprintf(params, sizeof(params), "{\"exposure\":%s}", argv[3]);
+		return ctl_call("hdr.exposure", params);
+	}
+
+	if (strcmp(topic, "hdr-passthrough") == 0) {
+		int on = parse_switch(argc >= 4 ? argv[3] : NULL);
+
+		if (on < 0) {
+			fprintf(stderr, "runtime hdr-passthrough needs 0 or 1\n");
+			return 1;
+		}
+		snprintf(params, sizeof(params),
+			 "{\"enabled\":%s}", on ? "true" : "false");
+		return ctl_call("hdr.passthrough", params);
+	}
+
+	if (strcmp(topic, "hotplug") == 0)
+		return ctl_call("hotplug", "{\"pulse\":true}");
+
+	if (strcmp(topic, "toast") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime toast needs text\n");
+			return 1;
+		}
+		json_escape(argv[3], escaped, sizeof(escaped));
+		snprintf(params, sizeof(params), "{\"message\":\"%s\"}", escaped);
+		return ctl_call("toast.show", params);
+	}
+
+	if (strcmp(topic, "volume") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "runtime volume needs 0..150\n");
+			return 1;
+		}
+		snprintf(params, sizeof(params), "{\"gain\":%g}",
+			 strtod(argv[3], NULL) / 100.0);
+		return ctl_call("audio.volume.set", params);
+	}
+
+	if (strcmp(topic, "mute") == 0) {
+		int on = parse_switch(argc >= 4 ? argv[3] : NULL);
+
+		if (on < 0) {
+			fprintf(stderr, "runtime mute needs 0 or 1\n");
+			return 1;
+		}
+		snprintf(params, sizeof(params),
+			 "{\"muted\":%s}", on ? "true" : "false");
+		return ctl_call("audio.mute.set", params);
+	}
+
+	if (strcmp(topic, "osd") == 0) {
+		int on = parse_switch(argc >= 4 ? argv[3] : NULL);
+
+		if (on < 0) {
+			fprintf(stderr, "runtime osd needs 0 or 1\n");
+			return 1;
+		}
+		snprintf(params, sizeof(params),
+			 "{\"enabled\":%s}", on ? "true" : "false");
+		return ctl_call("osd.set", params);
+	}
+
+	fprintf(stderr, "Unknown runtime topic: %s\n", topic);
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -209,6 +529,8 @@ int main(int argc, char **argv)
 		return cmd_service(argc, argv);
 	} else if (strcmp(cmd, "list-models") == 0) {
 		return cmd_list_models();
+	} else if (strcmp(cmd, "runtime") == 0 || strcmp(cmd, "ctl") == 0) {
+		return cmd_runtime(argc, argv);
 	} else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
 		print_usage(argv[0]);
 		return 0;

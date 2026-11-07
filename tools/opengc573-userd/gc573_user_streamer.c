@@ -27,6 +27,7 @@
 #include "gc573_user_nosignal.h"
 #include "gc573_user_ipc.h"
 #include "gc573_user_audio_tap.h"
+#include "gc573_user_video_tap.h"
 #include "gc573_user_hdr.h"
 #include "gc573_user_framegen.h"
 #include "gc573_user_font8x8.h"
@@ -529,6 +530,10 @@ static void print_usage(const char *prog)
 	printf("                    (default: %s).\n",
 	       GC573_AUDIO_TAP_DEFAULT);
 	printf("                    Add 'Monitor of EverLive Capture Audio' in OBS.\n");
+	printf("  --video-tap [NAME] Mirror captured video into a PipeWire Video/Source\n");
+	printf("                    (default: %s).\n",
+	       GC573_VIDEO_TAP_DEFAULT);
+	printf("                    Consumable directly by OBS, Discord and FFmpeg.\n");
 	printf("  --no-hdr          Disable HDR10/HLG -> SDR tonemapping (bypass).\n");
 	printf("  --hdr-exposure EV Exposure bias for the tonemapper, -2.0 .. +2.0.\n");
 	printf("  --framegen MODE   off|60to120|30to60 (native lsfg-vk 2x).\n");
@@ -757,8 +762,14 @@ static uint64_t now_ms(void)
 	return gc573_now_ms();
 }
 
+static uint64_t timespec_to_ns(const struct timespec *ts)
+{
+	return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
 static pthread_t g_led_thread;
 static bool g_led_thread_running;
+static volatile sig_atomic_t g_led_thread_stop;
 
 static void *led_worker(void *arg)
 {
@@ -767,7 +778,8 @@ static void *led_worker(void *arg)
 	uint32_t last_static = 0xFFFFFFFFu;
 	int last_mode = -1;
 
-	while (__atomic_load_n(&g_running, __ATOMIC_RELAXED)) {
+	while (!__atomic_load_n(&g_led_thread_stop, __ATOMIC_RELAXED) &&
+	       __atomic_load_n(&g_running, __ATOMIC_RELAXED)) {
 		int mode = __atomic_load_n(&g_led_mode_raw, __ATOMIC_RELAXED);
 
 		if (mode == STREAM_LED_WAVE) {
@@ -797,6 +809,30 @@ static void *led_worker(void *arg)
 		usleep(50000);
 	}
 	return NULL;
+}
+
+static int led_worker_start(struct gc573_vfio_ctx *ctx)
+{
+	if (g_led_thread_running)
+		return 0;
+	if (!ctx || !ctx->bar0)
+		return -EINVAL;
+
+	__atomic_store_n(&g_led_thread_stop, 0, __ATOMIC_RELAXED);
+	if (pthread_create(&g_led_thread, NULL, led_worker, ctx) != 0)
+		return -1;
+	g_led_thread_running = true;
+	return 0;
+}
+
+static void led_worker_stop(void)
+{
+	if (!g_led_thread_running)
+		return;
+
+	__atomic_store_n(&g_led_thread_stop, 1, __ATOMIC_RELAXED);
+	pthread_join(g_led_thread, NULL);
+	g_led_thread_running = false;
 }
 
 static const char *colorspace_name(uint8_t colorspace)
@@ -3004,11 +3040,13 @@ static struct gc573_shm_region *g_gc573_shm = NULL;
 
 static void gc573_shm_init(const char *pci_bdf)
 {
-	int fd = shm_open(GC573_SHM_NAME, O_CREAT | O_RDWR, 0666);
+	int fd = shm_open(GC573_SHM_NAME, O_CREAT | O_RDWR, 0600);
 	if (fd < 0) {
 		pr_warn("Failed to create shared memory %s: %s", GC573_SHM_NAME, strerror(errno));
 		return;
 	}
+	/* The frame store is private to the owning user; never world-writable. */
+	(void)fchmod(fd, 0600);
 	if (ftruncate(fd, sizeof(struct gc573_shm_region)) < 0) {
 		pr_warn("Failed to truncate shared memory %s: %s", GC573_SHM_NAME, strerror(errno));
 		close(fd);
@@ -3023,7 +3061,9 @@ static void gc573_shm_init(const char *pci_bdf)
 	}
 	g_gc573_shm = ptr;
 	g_gc573_shm->magic = GC573_SHM_MAGIC;
-	g_gc573_shm->version = 1;
+	g_gc573_shm->version = 2;
+	g_gc573_shm->publisher_pid = (uint32_t)getpid();
+	g_gc573_shm->heartbeat_ns = now_us() * 1000ULL;
 	if (pci_bdf)
 		snprintf(g_gc573_shm->pci_bdf, sizeof(g_gc573_shm->pci_bdf), "%s", pci_bdf);
 	printf("[SHM] Initialized %s for userspace camera preload\n", GC573_SHM_NAME);
@@ -3033,6 +3073,14 @@ static void gc573_shm_publish(const void *pixels, size_t bytes,
 			      unsigned int width, unsigned int height,
 			      unsigned int fps_num, unsigned int fps_den)
 {
+	if (gc573_video_tap_active() && pixels && width && height) {
+		unsigned int rate_x100 = 6000;
+		if (fps_den > 0 && fps_num > 0)
+			rate_x100 = (unsigned int)((uint64_t)fps_den * 100ULL / fps_num);
+		gc573_video_tap_set_format(width, height, rate_x100);
+		gc573_video_tap_write(pixels, bytes, width, height);
+	}
+
 	if (!g_gc573_shm || !pixels || !width || !height)
 		return;
 
@@ -3048,6 +3096,8 @@ static void gc573_shm_publish(const void *pixels, size_t bytes,
 	g_gc573_shm->port.fps_den = fps_den ? fps_den : 60;
 	g_gc573_shm->port.streaming = 1;
 	g_gc573_shm->port.timestamp_ns = now_us() * 1000ULL;
+	g_gc573_shm->publisher_pid = (uint32_t)getpid();
+	g_gc573_shm->heartbeat_ns = g_gc573_shm->port.timestamp_ns;
 	memcpy(g_gc573_shm->port.yuy2, pixels, bytes);
 
 	__atomic_store_n(&g_gc573_shm->port.seq, seq + 1, __ATOMIC_RELEASE);
@@ -3468,7 +3518,6 @@ static int audio_open_device(struct audio_playback *playback,
 	playback->bits = (int)sample_bits;
 	playback->bytes_per_frame = (sample_bits / 8U) * 2U;
 	playback->primed = false;
-	gc573_audio_tap_set_format((unsigned int)playback->rate);
 	/* Stay paused until audio_queue_pcm_bytes() has built the cushion. */
 	SDL_PauseAudioDevice(playback->dev, 1);
 	pr_info("SDL audio: opened %u Hz, 2 ch, %u-bit via %s (cushion %u ms)",
@@ -3883,12 +3932,6 @@ static void audio_queue_pcm_bytes(struct audio_stream *as, const void *data,
 
 	data = audio_apply_gain(as, data, bytes);
 
-	/*
-	 * Mirror exactly what SDL is about to play.  The tap normalises to S16
-	 * and never feeds back into the playback path.
-	 */
-	gc573_audio_tap_write(data, bytes, (unsigned int)playback->bits);
-
 	if (SDL_QueueAudio(playback->dev, data, (Uint32)bytes) < 0) {
 		if (!playback->queue_error_reported) {
 			pr_warn("SDL audio: SDL_QueueAudio failed: %s",
@@ -3959,6 +4002,8 @@ static bool audio_bitstream_prepare(struct audio_stream *as)
 	    audio_open_device(&as->playback, 48000, 16) < 0)
 		return false;
 
+	/* Decoded output is stereo even when the carrier is 5.1/7.1. */
+	gc573_audio_tap_set_format(48000, 2);
 	return true;
 }
 
@@ -3978,6 +4023,9 @@ static void audio_bitstream_decode(struct audio_stream *as,
 		return;
 	if (!out_bytes)
 		return;
+
+	/* Decoded AC-3/DTS output is always stereo S16. */
+	gc573_audio_tap_write(as->playback.scratch, out_bytes, 2, 2, 2);
 
 	as->bt_playing = true;
 	audio_queue_pcm_bytes(as, as->playback.scratch, out_bytes);
@@ -4112,6 +4160,18 @@ static void audio_queue_block(struct audio_stream *as, const void *data,
 	/* Ambiguous carriers stay silent until the LPCM window confirmed. */
 	if (!as->lpcm_verified)
 		return;
+
+	/*
+	 * Feed the capture tap from the raw DMA block, before gain/mute and
+	 * before the stereo fold-down, so a 5.1/7.1 source keeps its full
+	 * layout.  A 6-channel source still arrives in the FPGA's 8-slot
+	 * layout, which the tap compacts down to 6 published channels.
+	 */
+	if (as->format_channels && as->dma.dma_channels &&
+	    as->dma.sample_bytes)
+		gc573_audio_tap_write(data, bytes, as->dma.sample_bytes,
+				      as->dma.dma_channels,
+				      as->format_channels);
 
 	if (!playback->dev)
 		return;
@@ -4294,6 +4354,13 @@ static void audio_handle_format(struct audio_stream *as,
 		as->retry_after = now + AUDIO_RETRY_MS;
 		return;
 	}
+
+	/*
+	 * The capture tap mirrors the source layout.  Compressed carriers are
+	 * decoded to stereo, so their tap stays 2 ch at the decoder rate.
+	 */
+	gc573_audio_tap_set_format(bitstream ? 48000 : format->rate_hz,
+				   bitstream ? 2 : format->channels);
 
 	if (as->lock_ready)
 		pthread_mutex_lock(&as->lock);
@@ -5345,6 +5412,7 @@ static void hdr_apply(const struct gc573_user_video_signal *sig,
 static void apply_ipc_command(const struct gc573_ipc_cmd *cmd,
 			      SDL_Window *window,
 			      struct v4l2_sink *sink,
+			      struct gc573_vfio_ctx *ctx,
 			      uint32_t out_w, uint32_t out_h,
 			      const struct gc573_user_video_signal *sig,
 			      bool have_signal)
@@ -5529,10 +5597,194 @@ static void apply_ipc_command(const struct gc573_ipc_cmd *cmd,
 		toast_trigger(cmd->path);
 		printf("[IPC] Toast: %s\n", cmd->path);
 		break;
+	case GC573_IPC_CMD_EDID:
+		if (!ctx || !ctx->bar0) {
+			pr_warn("IPC EDID change ignored: hardware not initialized");
+			break;
+		}
+		if (gc573_user_edid_select(cmd->path, NULL) < 0) {
+			pr_warn("IPC EDID profile rejected: %s", cmd->path);
+			toast_trigger("EDID: Unknown Profile");
+			break;
+		}
+		g_bitstream_enabled = gc573_user_edid_advertises_bitstream();
+		if (gc573_user_program_edid_by_name(ctx->bar0,
+						    gc573_user_edid_active_name(),
+						    NULL) < 0) {
+			pr_warn("IPC EDID programming failed");
+			toast_trigger("EDID: Programming Failed");
+			break;
+		}
+		/*
+		 * Reprogramming the receiver is not visible to the source until
+		 * HPD is pulsed; enable_source() replays the upstream EDID and
+		 * toggles RX HPD, which is exactly the hotplug handshake.
+		 */
+		if (gc573_user_it6664_enable_source(ctx->bar0) < 0)
+			pr_warn("IPC EDID hotplug pulse failed");
+		printf("[IPC] EDID profile: %s\n",
+		       gc573_user_edid_active_name());
+		toast_trigger("EDID Updated");
+		break;
+	case GC573_IPC_CMD_HOTPLUG:
+		if (!ctx || !ctx->bar0) {
+			pr_warn("IPC hotplug ignored: hardware not initialized");
+			break;
+		}
+		if (!cmd->a) {
+			printf("[IPC] Hotplug pulse disabled\n");
+			break;
+		}
+		if (gc573_user_it6664_enable_source(ctx->bar0) < 0) {
+			pr_warn("IPC hotplug pulse failed");
+			toast_trigger("Hotplug Failed");
+			break;
+		}
+		printf("[IPC] HDMI hotplug pulse sent\n");
+		toast_trigger("HDMI Hotplug");
+		break;
+	case GC573_IPC_CMD_HDR_EV:
+		g_hdr_exposure_ev = cmd->f;
+		hdr_apply(sig, have_signal);
+		printf("[IPC] HDR exposure %+.1f EV\n",
+		       (double)g_hdr_exposure_ev);
+		toast_trigger("HDR Exposure Changed");
+		break;
 	default:
 		break;
 	}
 	fflush(stdout);
+}
+
+/*
+ * Re-acquire the GC573 after a system sleep/resume.
+ *
+ * A resume powers the PCIe function down and back up, which invalidates the
+ * VFIO group state, the BAR0 mapping and every DMA mapping.  The old stream
+ * cannot simply be poked back to life, so quiesce it, drop the VFIO context,
+ * and run the same bring-up sequence as the initial start.  The caller keeps
+ * the UI in standby and lets the normal signal probe restart capture.
+ *
+ * Returns 0 on success.  On failure the partially initialized context is
+ * cleaned up and a negative errno is returned so the caller can retry.
+ */
+static int gc573_resume_reinit(struct gc573_vfio_ctx *ctx,
+			       struct gc573_user_video *video,
+			       bool *video_ready,
+			       struct audio_stream *audio,
+			       const char *pci_addr,
+			       bool *it6805_irq_active,
+			       unsigned int *poll_stream_ms)
+{
+	int ret;
+
+	/*
+	 * Stop the LED worker first: it writes BAR0 from another thread and the
+	 * mapping is about to disappear.  It is restarted only after a complete
+	 * successful bring-up.
+	 */
+	led_worker_stop();
+
+	if (ctx->bar0) {
+		if (*it6805_irq_active) {
+			(void)gc573_user_it6805_enable_interrupts(ctx->bar0, false);
+			*it6805_irq_active = false;
+		}
+		(void)gc573_user_it6805_audio_disable(ctx->bar0);
+	}
+
+	/* The audio worker polls DMA state, so join it before unmapping. */
+	audio_worker_stop(audio);
+	audio_stop_capture(audio);
+	if (audio->dma_ready) {
+		gc573_user_audio_cleanup(&audio->dma);
+		audio->dma_ready = false;
+	}
+
+	if (*video_ready && ctx->bar0)
+		gc573_user_video_stop_timeout(video, VIDEO_STOP_HOT_MS);
+	if (*video_ready) {
+		gc573_user_video_cleanup(video);
+		*video_ready = false;
+	}
+
+	gc573_vfio_cleanup(ctx);
+
+	/* Re-open the container/group/device and remap BAR0. */
+	ret = gc573_vfio_init(ctx, pci_addr);
+	if (ret < 0)
+		goto fail;
+
+	ret = gc573_user_hw_init(ctx->bar0);
+	if (ret < 0) {
+		pr_err("FPGA/bridge re-init failed after resume: %d", ret);
+		goto fail_vfio;
+	}
+
+	/* Restore the selected LED mode while the receiver comes up. */
+	if (g_led_mode == STREAM_LED_WAVE) {
+		uint32_t default_zones[5] = {
+			0x00ff0000, 0x00ffff00, 0x0000ff00, 0x0000ffff, 0x008000ff,
+		};
+		gc573_user_set_led_zones(ctx->bar0, default_zones);
+	} else {
+		gc573_user_set_led_rgb(ctx->bar0, g_led_r, g_led_g, g_led_b);
+	}
+
+	ret = gc573_user_it6664_init(ctx->bar0);
+	if (ret < 0) {
+		pr_err("IT6664 re-init failed after resume: %d", ret);
+		goto fail_vfio;
+	}
+
+	ret = gc573_user_it6805_init(ctx->bar0);
+	if (ret < 0) {
+		pr_err("IT6805 re-init failed after resume: %d", ret);
+		goto fail_vfio;
+	}
+
+	if (gc573_user_it6805_enable_interrupts(ctx->bar0, true) == 0) {
+		*it6805_irq_active = true;
+		*poll_stream_ms = 200U;
+	} else {
+		*it6805_irq_active = false;
+		*poll_stream_ms = STATUS_POLL_STREAM_MS;
+	}
+
+	ret = gc573_user_program_edid_by_name(ctx->bar0,
+					      gc573_user_edid_active_name(), NULL);
+	if (ret < 0) {
+		pr_err("EDID reprogramming failed after resume: %d", ret);
+		goto fail_vfio;
+	}
+
+	ret = gc573_user_it6664_enable_source(ctx->bar0);
+	if (ret < 0) {
+		pr_err("IT6664 source enable failed after resume: %d", ret);
+		goto fail_vfio;
+	}
+
+	if (gc573_vfio_setup_msi(ctx) < 0)
+		pr_warn("Interrupt setup failed after resume; falling back to IRQ polling");
+
+	if (led_worker_start(ctx) < 0)
+		pr_warn("LED worker restart failed after resume");
+
+	if (gc573_user_audio_init(&audio->dma, ctx, ctx->bar0) == 0) {
+		audio->dma_ready = true;
+		if (audio_worker_start(audio) < 0)
+			pr_warn("Audio worker restart failed after resume");
+	} else {
+		pr_warn("Audio DMA remap failed after resume; continuing video-only");
+	}
+
+	return 0;
+
+fail_vfio:
+	gc573_vfio_cleanup(ctx);
+fail:
+	pr_err("GC573 hardware re-initialization after resume failed: %d", ret);
+	return ret ? ret : -EIO;
 }
 
 int main(int argc, char *argv[])
@@ -5545,6 +5797,7 @@ int main(int argc, char *argv[])
 	const char *v4l2_device = NULL;
 	const char *ipc_socket_override = NULL;
 	const char *audio_tap_node = NULL;
+	const char *video_tap_node = NULL;
 	bool ipc_disabled = false;
 	struct gc573_vfio_ctx ctx;
 	struct gc573_user_video video;
@@ -5576,6 +5829,10 @@ int main(int argc, char *argv[])
 	bool have_signal = false;
 	unsigned int signal_lost_hits = 0;
 	bool rate_probe_after_scdt = false;
+	struct timespec resume_mono_prev = { 0 }, resume_boot_prev = { 0 };
+	uint64_t last_resume_check = 0;
+	uint64_t resume_next_try_ms = 0;
+	bool resume_pending = false;
 	int ret;
 
 	signal(SIGINT, sig_handler);
@@ -5679,6 +5936,15 @@ int main(int argc, char *argv[])
 				audio_tap_node = GC573_AUDIO_TAP_DEFAULT;
 		} else if (strncmp(argv[i], "--audio-tap=", 12) == 0) {
 			audio_tap_node = argv[i] + 12;
+		} else if (strcmp(argv[i], "--video-tap") == 0) {
+			if (i + 1 < argc && argv[i + 1][0] != '-')
+				video_tap_node = argv[++i];
+			else
+				video_tap_node = GC573_VIDEO_TAP_DEFAULT;
+		} else if (strncmp(argv[i], "--video-tap=", 12) == 0) {
+			video_tap_node = argv[i] + 12;
+		} else if (strcmp(argv[i], "--no-video-tap") == 0) {
+			video_tap_node = NULL;
 		} else if (strcmp(argv[i], "-f") == 0 ||
 			   strcmp(argv[i], "--fullscreen") == 0) {
 			g_fullscreen = true;
@@ -5855,8 +6121,8 @@ int main(int argc, char *argv[])
 	 * wave and rainbow at runtime, and a static colour change must reach the
 	 * controller without restarting the streamer.
 	 */
-	if (pthread_create(&g_led_thread, NULL, led_worker, &ctx) == 0)
-		g_led_thread_running = true;
+	if (led_worker_start(&ctx) < 0)
+		pr_warn("LED worker thread unavailable; LED stays at the initial colour");
 
 	/*
 	 * 3. Bring up the IT6664 splitter first.  The source only sees the
@@ -6106,11 +6372,22 @@ int main(int argc, char *argv[])
 				strerror(-tap_ret));
 	}
 
+	if (video_tap_node) {
+		int vtap_ret = gc573_video_tap_start(video_tap_node);
+
+		if (vtap_ret < 0)
+			pr_warn("Video tap unavailable (%s); continuing without it",
+				strerror(-vtap_ret));
+	}
+
 	last_stats = now_ms();
 	last_stats_us = now_us();
 	last_status_poll = 0;
 	last_service = 0;
 	g_loop_start_ms = now_ms();
+	clock_gettime(CLOCK_MONOTONIC, &resume_mono_prev);
+	clock_gettime(CLOCK_BOOTTIME, &resume_boot_prev);
+	last_resume_check = now_ms();
 
 	while (g_running) {
 		SDL_Event event;
@@ -6252,7 +6529,7 @@ int main(int argc, char *argv[])
 		 * ever appends to the lock-free command ring.
 		 */
 		while (gc573_ipc_poll_cmd(&ipc_cmd))
-			apply_ipc_command(&ipc_cmd, window, &v4l2_sink,
+			apply_ipc_command(&ipc_cmd, window, &v4l2_sink, &ctx,
 					  output_width, output_height,
 					  &current_sig, have_signal);
 
@@ -6307,6 +6584,85 @@ int main(int argc, char *argv[])
 		}
 
 		now = now_ms();
+
+		/*
+		 * Detect system sleep/resume.  CLOCK_MONOTONIC stops during
+		 * suspend while CLOCK_BOOTTIME keeps counting, so a boot delta
+		 * that exceeds the monotonic delta by seconds means the machine
+		 * was asleep.  The PCIe function loses its VFIO state and every
+		 * hardware register across that boundary, so schedule a full
+		 * bring-up instead of trusting the old stream.
+		 */
+		if (now - last_resume_check >= 250) {
+			struct timespec mono_now;
+			struct timespec boot_now;
+			uint64_t mono_delta;
+			uint64_t boot_delta;
+
+			clock_gettime(CLOCK_MONOTONIC, &mono_now);
+			clock_gettime(CLOCK_BOOTTIME, &boot_now);
+			mono_delta = timespec_to_ns(&mono_now) -
+				     timespec_to_ns(&resume_mono_prev);
+			boot_delta = timespec_to_ns(&boot_now) -
+				     timespec_to_ns(&resume_boot_prev);
+			resume_mono_prev = mono_now;
+			resume_boot_prev = boot_now;
+			last_resume_check = now;
+
+			if (boot_delta > mono_delta + 2000000000ULL) {
+				printf("[RESUME] System sleep detected (slept %llu ms); re-initializing GC573\n",
+				       (unsigned long long)
+				       ((boot_delta - mono_delta) / 1000000ULL));
+				fflush(stdout);
+				resume_pending = true;
+				resume_next_try_ms = 0;
+			}
+		}
+
+		if (resume_pending && now >= resume_next_try_ms) {
+			/*
+			 * Return to standby before touching the hardware: if the
+			 * re-init fails the UI must not keep showing a frozen
+			 * pre-suspend frame.
+			 */
+			preview_stop();
+			streaming = false;
+			have_signal = false;
+			signal_lost_hits = 0;
+			rate_probe_after_scdt = false;
+			last_status_poll = 0;
+			last_service = 0;
+			last_stats = now_ms();
+			last_stats_us = now_us();
+			input_width = 0;
+			input_height = 0;
+			input_rate_x100 = 0;
+			output_width = 0;
+			output_height = 0;
+			memset(&current_sig, 0, sizeof(current_sig));
+			memset(&watch, 0, sizeof(watch));
+			if (texture) {
+				SDL_DestroyTexture(texture);
+				texture = NULL;
+			}
+			render_standby(window, renderer,
+				       "EverLive Experimental — Resuming from sleep...");
+
+			if (gc573_resume_reinit(&ctx, &video, &video_ready,
+						&audio, pci_addr,
+						&it6805_irq_active,
+						&poll_stream_ms) == 0) {
+				printf("[RESUME] GC573 re-initialized; waiting for HDMI\n");
+				fflush(stdout);
+				resume_pending = false;
+				toast_trigger("System Resume — Reinitialized");
+			} else {
+				resume_pending = true;
+				resume_next_try_ms = now_ms() + 5000U;
+				render_standby(window, renderer,
+					       "EverLive Experimental — Hardware unavailable after resume, retrying...");
+			}
+		}
 
 		if (streaming && it6805_irq_active) {
 			bool scdt_chg = false, avi_chg = false;
@@ -6529,6 +6885,9 @@ int main(int argc, char *argv[])
 								input_height = fresh.height;
 								input_rate_x100 =
 									fresh.frame_rate_x100;
+								if (gc573_video_tap_active())
+									gc573_video_tap_set_format(new_out_w, new_out_h,
+												   fresh.frame_rate_x100 ? fresh.frame_rate_x100 : 6000);
 								if (g_framegen)
 									gc573_framegen_set_source_hz(
 										g_framegen,
@@ -6619,6 +6978,9 @@ int main(int argc, char *argv[])
 							input_height = sig.height;
 							input_rate_x100 =
 								sig.frame_rate_x100;
+							if (gc573_video_tap_active())
+								gc573_video_tap_set_format(new_out_w, new_out_h,
+											   sig.frame_rate_x100 ? sig.frame_rate_x100 : 6000);
 							if (g_framegen)
 								gc573_framegen_set_source_hz(
 									g_framegen, input_rate_x100);
@@ -7141,6 +7503,7 @@ int main(int argc, char *argv[])
 	 * notices within one poll interval that the session ended. */
 	gc573_ipc_stop();
 	gc573_audio_tap_stop();
+	gc573_video_tap_stop();
 
 	if (g_trace_requested) {
 		v4l2_pump_stop();

@@ -18,7 +18,7 @@ $(TARGET_SHARED): $(OBJS)
 	$(CC) -shared -o $@ $^
 
 $(TARGET_CLI): everlive_ctl.o $(TARGET_STATIC)
-	$(CC) $(CFLAGS) -o $@ everlive_ctl.o -L. -leverlive_core
+	$(CC) $(CFLAGS) -o $@ everlive_ctl.o $(TARGET_STATIC)
 
 %.o: %.c everlive_card.h everlive_frame.h
 	$(CC) $(CFLAGS) -c -o $@ $<

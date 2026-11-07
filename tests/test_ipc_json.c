@@ -67,6 +67,20 @@ static void test_json_get_bool(void)
 		    "Rejects non-boolean value");
 }
 
+static void test_json_get_double(void)
+{
+	double val = 0.0;
+	const char *json = "{\"exposure\":-1.5,\"gain\":0.85}";
+
+	printf("Testing json_get_double...\n");
+	TEST_ASSERT(json_get_double(json, "exposure", &val) && val == -1.5,
+		    "Extracts negative float 'exposure': -1.5");
+	TEST_ASSERT(json_get_double(json, "gain", &val) && val > 0.84 && val < 0.86,
+		    "Extracts positive float 'gain': 0.85");
+	TEST_ASSERT(!json_get_double(json, "nonexistent", &val),
+		    "Fails cleanly on missing float key");
+}
+
 static void test_json_escape_into(void)
 {
 	char dst[128];
@@ -115,6 +129,7 @@ int main(void)
 
 	test_json_get_string();
 	test_json_get_long();
+	test_json_get_double();
 	test_json_get_bool();
 	test_json_escape_into();
 	test_json_format_id();

@@ -30,6 +30,16 @@ struct gc573_shm_region {
 	uint32_t version;
 	char pci_bdf[32];
 	struct gc573_shm_port port;
+
+	/*
+	 * Liveness beacon for consumers.  Appended after the frame payload so
+	 * existing width/height/seq offsets stay stable.  heartbeat_ns is
+	 * CLOCK_MONOTONIC; a consumer that sees it older than ~1 s knows the
+	 * publisher died and should emit a black frame instead of a stale one.
+	 */
+	uint32_t publisher_pid;
+	uint32_t reserved;
+	uint64_t heartbeat_ns;
 };
 
 #endif /* GC573_SHM_H */

@@ -2171,9 +2171,10 @@ if HAS_QT:
     SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
     SHM_MAGIC = 0x47433537  # "GC57"
     SHM_HEADER_SIZE = 40
-    SHM_PORT_HEADER_SIZE = 32
+    SHM_PORT_HEADER_SIZE = 48
     SHM_FRAME_BYTES = 1920 * 1080 * 2
-    SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_FRAME_BYTES
+    SHM_SLOTS = 3
+    SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_SLOTS * SHM_FRAME_BYTES
 
     # Base 256-byte CTA-861 EDID for custom modeline synthesis
     BASE_GC573_EDID = bytes.fromhex(
@@ -2657,14 +2658,17 @@ if HAS_QT:
 
                     port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
                     seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
-                    if seq & 1 != 0:
+                    if seq == 0:
                         return
                     if seq == self._last_seq and self._current_qimage is not None:
                         return
 
                     width, height, no_signal, streaming = struct.unpack_from(
                         "<IIII", self._shm_mmap, port_off + 16)
-                    yuy2_off = port_off + 32
+                    ready_idx = struct.unpack_from("<I", self._shm_mmap, port_off + 36)[0]
+                    if ready_idx >= SHM_SLOTS:
+                        return
+                    yuy2_off = port_off + SHM_PORT_HEADER_SIZE + ready_idx * SHM_FRAME_BYTES
 
                 if streaming == 0:
                     if self.is_streaming:

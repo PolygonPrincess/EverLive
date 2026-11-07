@@ -530,7 +530,7 @@ context.objects = [
           node.name               = "everlive-capture-audio"
           node.description        = "EverLive Capture Audio"
           media.class             = Audio/Sink
-          audio.position          = [ FL FR ]
+          audio.position          = [ FL FR FC LFE RL RR SL SR ]
           monitor.channel-volumes = true
           node.virtual            = false
       }
@@ -575,7 +575,12 @@ cat > /etc/udev/rules.d/70-everlive.rules <<EOF
 # AVerMedia Live Gamer 4K (GC573) & Live Gamer BOLT (GC555) - Userspace VFIO Mode
 ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1461", ATTR{device}=="0x0054", ATTR{driver_override}="vfio-pci"
 ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1461", ATTR{device}=="0x0055", ATTR{driver_override}="vfio-pci"
-SUBSYSTEM=="vfio", MODE="0660", TAG+="uaccess", GROUP="video"
+# /dev/vfio/vfio is the shared control device; only the per-group nodes are
+# scoped to the two AVerMedia PCI IDs so unrelated VFIO assignments are not
+# silently exposed to the local seat.
+SUBSYSTEM=="vfio", KERNEL=="vfio", MODE="0660", TAG+="uaccess", GROUP="video"
+SUBSYSTEM=="vfio", KERNEL=="[0-9]*", ATTRS{vendor}=="0x1461", ATTRS{device}=="0x0054", MODE="0660", TAG+="uaccess", GROUP="video"
+SUBSYSTEM=="vfio", KERNEL=="[0-9]*", ATTRS{vendor}=="0x1461", ATTRS{device}=="0x0055", MODE="0660", TAG+="uaccess", GROUP="video"
 EOF
 
 udevadm control --reload-rules 2>/dev/null || true
