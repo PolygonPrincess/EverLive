@@ -10,7 +10,7 @@ through its Unix socket and mirrors the engine's own view of the hardware.
 
 Phase 1 is read-only (``hello`` / ``ping`` / ``status.get``); Phase 2 adds the
 live mutations (LED, audio gain/mute, OSD, aspect), which the streamer applies
-from the lock-free command ring on its render thread.  EverLive adds
+from the lock-free command ring on its render thread.  EverLive Experimental adds
 ``framegen.set`` for lsfg-vk frame generation (Lossless Scaling 2x).  Two entry
 points are provided:
 
@@ -33,6 +33,7 @@ import socket
 import time
 
 SOCKET_NAME = "everlive.sock"
+SOCKET_NAME_LEGACY = "everlive-experimental.sock"
 PROTO_VERSION = 1
 MAX_FRAME = 65536
 
@@ -72,15 +73,29 @@ def socket_path() -> str:
     if override:
         return override
 
+    candidates = [SOCKET_NAME, SOCKET_NAME_LEGACY]
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base and os.path.isdir(base):
+        for name in candidates:
+            p = os.path.join(base, name)
+            if os.path.exists(p):
+                return p
         return os.path.join(base, SOCKET_NAME)
 
     fallback = f"/run/user/{os.getuid()}"
     if os.path.isdir(fallback):
+        for name in candidates:
+            p = os.path.join(fallback, name)
+            if os.path.exists(p):
+                return p
         return os.path.join(fallback, SOCKET_NAME)
 
-    return os.path.join(f"/tmp/everlive-{os.getuid()}", SOCKET_NAME)
+    tmp_dir = f"/tmp/everlive-{os.getuid()}"
+    for name in candidates:
+        p = os.path.join(tmp_dir, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(tmp_dir, SOCKET_NAME)
 
 
 def probe(timeout: float = 0.25):
@@ -308,15 +323,26 @@ if QSocketNotifier is not None:
                 params["device"] = str(device)
             return self.request("v4l2.set", params)
 
-        def set_hdr(self, enabled: bool, exposure_ev: float = 0.0) -> bool:
+        def set_hdr(self, enabled: bool, exposure_ev: float = 0.0,
+                    passthrough: bool = False) -> bool:
             """Enable/disable HDR10/HLG to SDR tonemapping on a running engine.
 
             ``exposure_ev`` biases the ACES curve, -2.0 .. +2.0 EV.
+            ``passthrough`` preserves native BT.2020 PQ/HLG for HDR displays.
             """
             return self.request("hdr.set", {
-                "mode": "auto" if enabled else "off",
+                "mode": "passthrough" if (enabled and passthrough) else ("auto" if enabled else "off"),
                 "exposure": max(-2.0, min(2.0, float(exposure_ev))),
+                "passthrough": bool(passthrough),
             })
+
+        def set_hdr_passthrough(self, enabled: bool) -> bool:
+            """Toggle native HDR passthrough on an active HDR stream."""
+            return self.request("hdr.passthrough", {"enabled": bool(enabled)})
+
+        def show_toast(self, message: str) -> bool:
+            """Trigger an OSD toast notification on the gaming screen."""
+            return self.request("toast.show", {"message": str(message)})
 
         def set_scale(self, mode: str) -> bool:
             """Scaling mode: ``fit`` (bilinear) or ``integer`` (nearest).
