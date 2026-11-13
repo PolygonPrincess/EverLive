@@ -8,6 +8,7 @@
 #   make install DESTDIR="$pkgdir" PREFIX=/usr  # distro packaging
 #   sudo make uninstall                         # remove system-wide install
 
+PYTHON          ?= python3
 PREFIX          ?= /usr/local
 DESTDIR         ?=
 BINDIR          ?= $(PREFIX)/bin
@@ -55,6 +56,7 @@ gc570d: core
 
 test: all
 	+$(MAKE) -C $(TESTS_DIR) test
+	$(PYTHON) -m unittest discover -s tools/everlive/tests
 
 check: test
 

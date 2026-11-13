@@ -37,6 +37,9 @@ jobs:
       - name: Unit tests (GCC)
         run: make -C tests clean test
 
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tools/everlive/tests -v
+
       - name: Staged system-wide install and uninstall
         run: |
           make install DESTDIR="$RUNNER_TEMP/stage" PREFIX=/usr
@@ -65,6 +68,7 @@ jobs:
         run: |
           python3 -m py_compile tools/everlive/everlive_viewer.py
           python3 -m py_compile tools/everlive/everlive_client.py
+          python3 -m py_compile tools/everlive/framestore.py
 
       - name: Verify shell script syntax
         run: |

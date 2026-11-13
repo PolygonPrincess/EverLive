@@ -14,9 +14,8 @@ import argparse
 import re
 import json
 import shutil
-import mmap
 import ctypes
-import struct
+import ctypes.util
 import math
 import queue
 import threading
@@ -30,9 +29,11 @@ except ImportError:
 
 try:
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from framestore import FrameStore, FrameStoreError, open_store
 except ImportError:  # imported as a module from another working directory
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from framestore import FrameStore, FrameStoreError, open_store
 
 __version__ = "1.5.0"
 
@@ -56,12 +57,6 @@ AUDIO_TAP_NODE = "everlive-capture-audio"
 
 SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
 SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
-SHM_MAGIC = 0x47433537  # "GC57"
-SHM_HEADER_SIZE = 40
-SHM_PORT_HEADER_SIZE = 48
-SHM_FRAME_BYTES = 1920 * 1080 * 2
-SHM_SLOTS = 3
-SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_SLOTS * SHM_FRAME_BYTES
 
 ASPECT_OPTIONS = [
     ("Auto (Native HDMI)", "auto"),
@@ -1246,6 +1241,30 @@ class GameStreamer:
         self.duo_input = 0
         saved_signal = load_settings().get("last_signal")
         self._vfio_signal = saved_signal if isinstance(saved_signal, dict) else None
+        self._signal_store: Optional[FrameStore] = None
+        self._signal_store_path: Optional[str] = None
+
+    def _close_signal_store(self):
+        if self._signal_store is not None:
+            try:
+                self._signal_store.close()
+            except Exception:
+                pass
+        self._signal_store = None
+        self._signal_store_path = None
+
+    def _get_signal_store(self, path: str) -> Optional[FrameStore]:
+        store = self._signal_store
+        if store is not None:
+            if self._signal_store_path != path or store.is_stale():
+                self._close_signal_store()
+                store = None
+        if store is None:
+            store = open_store(path)
+            if store is not None:
+                self._signal_store = store
+                self._signal_store_path = path
+        return store
 
     def _update_vfio_signal(self, width: int, height: int, scan: str,
                             rate_hz: int, rate_frac: int,
@@ -1418,38 +1437,28 @@ class GameStreamer:
         sig = self._vfio_signal or {}
         live = bool(self.is_running and self._vfio_live and sig.get("resolution"))
         if not live:
-            # Check shared memory directly if streamer log parsing is lagging
-            target_shm = SHM_GC573_NAME if (not self.duo_mode and os.path.exists(SHM_GC573_NAME)) else SHM_NAME
-            if os.path.exists(target_shm):
-                try:
-                    with open(target_shm, "rb") as f:
-                        buf = f.read(256)
-                    if len(buf) >= 64:
-                        magic = struct.unpack_from("<I", buf, 0)[0]
-                        if magic == SHM_MAGIC:
-                            if target_shm == SHM_GC573_NAME:
-                                port_off = 40
-                                w, h, ns, st = struct.unpack_from("<IIII", buf, port_off + 16)
-                            else:
-                                port = getattr(self, "duo_input", 0)
-                                port_off = SHM_HEADER_SIZE + port * SHM_PORT_SIZE
-                                if len(buf) >= port_off + 32:
-                                    w, h, ns, st = struct.unpack_from("<IIII", buf, port_off + 16)
-                                else:
-                                    w, h, ns, st = 0, 0, 1, 0
-                            if st != 0 and ns == 0 and w > 0 and h > 0:
-                                live = True
-                                self._duo_no_signal = False
-                                self._vfio_live = True
-                                sig = {
-                                    "resolution": f"{w}x{h}p",
-                                    "framerate": "60.00 FPS",
-                                    "chroma": sig.get("chroma") or "YUV 4:2:2",
-                                    "hdr": sig.get("hdr") or "SDR",
-                                }
-                                self._vfio_signal = sig
-                except Exception:
-                    pass
+            # Check the shared frame store directly if streamer log parsing is
+            # lagging.  The store also covers legacy engines until they are
+            # rebuilt against the current core.
+            target_shm = (SHM_GC573_NAME
+                          if (not self.duo_mode and os.path.exists(SHM_GC573_NAME))
+                          else SHM_NAME)
+            store = self._get_signal_store(target_shm)
+            if store is not None:
+                port = getattr(self, "duo_input", 0) if self.duo_mode else 0
+                signal = store.signal(port)
+                if signal is not None and signal.locked:
+                    live = True
+                    self._duo_no_signal = False
+                    self._vfio_live = True
+                    fps = signal.fps if signal.fps else 60.0
+                    sig = {
+                        "resolution": f"{signal.width}x{signal.height}p",
+                        "framerate": f"{fps:.2f} FPS",
+                        "chroma": sig.get("chroma") or "YUV 4:2:2",
+                        "hdr": sig.get("hdr") or "SDR",
+                    }
+                    self._vfio_signal = sig
 
         has_cache = bool(sig.get("resolution") and
                          sig.get("resolution") != "No Signal")
@@ -2245,6 +2254,7 @@ class GameStreamer:
 
     def stop(self):
         self.is_running = False
+        self._close_signal_store()
         if self.vfio_mode:
             self._read_vfio_log()
             self._vfio_live = False
@@ -2339,15 +2349,6 @@ class GameStreamer:
 
 
 if HAS_QT:
-    SHM_NAME = "/dev/shm/gc570d_v4l2_shm"
-    SHM_GC573_NAME = "/dev/shm/gc573_v4l2_shm"
-    SHM_MAGIC = 0x47433537  # "GC57"
-    SHM_HEADER_SIZE = 40
-    SHM_PORT_HEADER_SIZE = 48
-    SHM_FRAME_BYTES = 1920 * 1080 * 2
-    SHM_SLOTS = 3
-    SHM_PORT_SIZE = SHM_PORT_HEADER_SIZE + SHM_SLOTS * SHM_FRAME_BYTES
-
     # Base 256-byte CTA-861 EDID for custom modeline synthesis
     BASE_GC573_EDID = bytes.fromhex(
         "00ffffffffffff0006d8360000000000"
@@ -3041,18 +3042,46 @@ if HAS_QT:
             pass
         return 0
 
-    _lib_core = None
-    try:
-        _core_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "libeverlive-core", "libeverlive_core.so")
-        if os.path.isfile(_core_path):
-            _lib_core = ctypes.CDLL(_core_path)
-            _lib_core.everlive_yuy2_to_rgb.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-            _lib_core.everlive_yuy2_to_rgb_scaled.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    except Exception:
-        _lib_core = None
+    def _load_core_library():
+        """Find libeverlive_core from a source tree or a system install."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = []
+        found = ctypes.util.find_library("everlive_core")
+        if found:
+            candidates.append(found)
+        candidates.extend([
+            os.path.join(here, "..", "libeverlive-core", "libeverlive_core.so"),
+            "/usr/local/lib/libeverlive_core.so",
+            "/usr/lib/libeverlive_core.so",
+            "/usr/lib64/libeverlive_core.so",
+            "/usr/local/lib/libeverlive_core.so.0",
+            "/usr/lib/libeverlive_core.so.0",
+            "/usr/lib64/libeverlive_core.so.0",
+        ])
+        seen = set()
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                lib = ctypes.CDLL(path)
+            except Exception:
+                continue
+            rgb = getattr(lib, "everlive_yuy2_to_rgb", None)
+            if rgb is not None:
+                rgb.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int]
+            scaled = getattr(lib, "everlive_yuy2_to_rgb_scaled", None)
+            if scaled is not None:
+                scaled.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int]
+            return lib
+        return None
+
+    _lib_core = _load_core_library()
 
     class EmbeddedVideoCanvas(QWidget):
         """Zero-latency embedded live video canvas for EverLive Console Hub.
@@ -3082,9 +3111,8 @@ if HAS_QT:
             self._current_qimage = None
             self._rgb_buffer = None
             self._last_seq = 0
-            self._shm_file = None
-            self._shm_mmap = None
-            self._is_gc573_shm = False
+            self._store: Optional[FrameStore] = None
+            self._store_path: Optional[str] = None
             self._toast_message = ""
             self._toast_start = 0.0
             self._toast_duration = 3.0
@@ -3156,121 +3184,147 @@ if HAS_QT:
             self._toast_duration = max(0.5, float(duration))
             self.update()
 
-        def poll_frame(self):
-            target_shm = SHM_GC573_NAME if (not self.duo_mode and os.path.exists(SHM_GC573_NAME)) else SHM_NAME
-            if self._shm_mmap is None:
-                if not os.path.exists(target_shm):
-                    if self.is_streaming:
-                        self.is_streaming = False
-                        self.has_signal = False
-                        self._current_qimage = None
-                        if self._prev_has_signal:
-                            self._prev_has_signal = False
-                            self.show_toast("HDMI Signal: Disconnected")
-                        self.update()
-                    return
+        def _close_store(self):
+            if self._store is not None:
                 try:
-                    self._shm_file = open(target_shm, "rb")
-                    self._shm_mmap = mmap.mmap(
-                        self._shm_file.fileno(), 0, prot=mmap.PROT_READ)
-                    self._is_gc573_shm = (target_shm == SHM_GC573_NAME)
+                    self._store.close()
                 except Exception:
-                    self._shm_file = None
-                    self._shm_mmap = None
-                    return
+                    pass
+            self._store = None
+            self._store_path = None
+
+        def _open_store(self, path: str) -> Optional[FrameStore]:
+            if self._store is not None:
+                if self._store_path != path or self._store.is_stale():
+                    self._close_store()
+            if self._store is None:
+                store = open_store(path)
+                if store is not None:
+                    self._store = store
+                    self._store_path = path
+            return self._store
+
+        def _set_disconnected(self):
+            if not (self.is_streaming or self._prev_has_signal):
+                return
+            self.is_streaming = False
+            self.has_signal = False
+            self._current_qimage = None
+            if self._prev_has_signal:
+                self._prev_has_signal = False
+                self.show_toast("HDMI Signal: Disconnected")
+            self.update()
+
+        def _preview_size(self, width: int, height: int) -> Tuple[int, int]:
+            """Convert at the widget size, not the full 4K source size."""
+            max_w = max(1, self.width())
+            max_h = max(1, self.height())
+            if width <= 0 or height <= 0:
+                return width, height
+            scale = min(max_w / float(width), max_h / float(height), 1.0)
+            out_w = max(2, int(width * scale))
+            out_h = max(2, int(height * scale))
+            if out_w & 1:
+                out_w -= 1
+            return max(2, out_w), max(2, out_h)
+
+        def _ensure_rgb(self, size: int):
+            if self._rgb_buffer is None or len(self._rgb_buffer) != size:
+                self._rgb_buffer = bytearray(size)
+
+        def poll_frame(self):
+            target_shm = (SHM_GC573_NAME
+                          if (not self.duo_mode and os.path.exists(SHM_GC573_NAME))
+                          else SHM_NAME)
+            if not os.path.exists(target_shm):
+                self._close_store()
+                self._set_disconnected()
+                return
+
+            store = self._open_store(target_shm)
+            if store is None:
+                return
 
             try:
-                magic = struct.unpack_from("<I", self._shm_mmap, 0)[0]
-                if magic != SHM_MAGIC:
+                if self.duo_mode:
+                    other_port = 1 if self.port == 0 else 0
+                    other = store.signal(other_port)
+                    self.other_port_has_signal = (
+                        other_port if (other is not None and other.locked) else None)
+
+                frame = store.frame(self.port)
+                if frame is None:
+                    return
+                if frame.seq == self._last_seq and self._current_qimage is not None:
                     return
 
-                if self._is_gc573_shm:
-                    port_off = 40
-                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
-                    if seq & 1 != 0:
-                        return
-                    if seq == self._last_seq and self._current_qimage is not None:
-                        return
-                    width, height, no_signal, streaming, fps_num, fps_den = struct.unpack_from(
-                        "<IIIIII", self._shm_mmap, port_off + 16)
-                    yuy2_off = port_off + 40
-                else:
-                    # In DUO mode, monitor the alternate port for active HDMI signal
-                    if self.duo_mode:
-                        other_port = 1 if self.port == 0 else 0
-                        other_off = SHM_HEADER_SIZE + other_port * SHM_PORT_SIZE
-                        other_w, other_h, other_ns, other_st = struct.unpack_from(
-                            "<IIII", self._shm_mmap, other_off + 16)
-                        if other_st != 0 and other_ns == 0 and other_w > 0:
-                            self.other_port_has_signal = other_port
-                        else:
-                            self.other_port_has_signal = None
-
-                    port_off = SHM_HEADER_SIZE + self.port * SHM_PORT_SIZE
-                    seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
-                    if seq == 0:
-                        return
-                    if seq == self._last_seq and self._current_qimage is not None:
-                        return
-
-                    width, height, no_signal, streaming = struct.unpack_from(
-                        "<IIII", self._shm_mmap, port_off + 16)
-                    ready_idx = struct.unpack_from("<I", self._shm_mmap, port_off + 36)[0]
-                    if ready_idx >= SHM_SLOTS:
-                        return
-                    yuy2_off = port_off + SHM_PORT_HEADER_SIZE + ready_idx * SHM_FRAME_BYTES
-
-                if streaming == 0:
-                    if self.is_streaming:
-                        self.is_streaming = False
-                        self.has_signal = False
-                        self._current_qimage = None
-                        if self._prev_has_signal:
-                            self._prev_has_signal = False
-                            self.show_toast("HDMI Signal: Disconnected")
-                        self.update()
+                if not frame.streaming:
+                    self._last_seq = frame.seq
+                    self._set_disconnected()
                     return
 
                 self.is_streaming = True
-                if no_signal != 0 or width == 0 or height == 0:
+                if frame.no_signal or frame.width <= 0 or frame.height <= 0:
+                    self._last_seq = frame.seq
                     if self.has_signal or self._current_qimage is not None:
                         self.has_signal = False
                         self._current_qimage = None
-                        self.signal_desc = f"No HDMI Signal (Port {self.port + 1})" if self.duo_mode else "No HDMI Signal"
+                        self.signal_desc = (
+                            f"No HDMI Signal (Port {self.port + 1})"
+                            if self.duo_mode else "No HDMI Signal")
                         if self._prev_has_signal:
                             self._prev_has_signal = False
                             self.show_toast("HDMI Signal: Disconnected")
                         self.update()
+                    return
+
+                width, height = frame.width, frame.height
+                if width & 1:
                     return
 
                 self.has_signal = True
                 self.current_width = width
                 self.current_height = height
-                self.signal_desc = f"{width}×{height} @ 60 Hz"
+                fps = frame.fps or 60.0
+                self.signal_desc = f"{width}×{height} @ {fps:.0f} Hz"
                 if not self._prev_has_signal:
                     self._prev_has_signal = True
                     self.show_toast(f"HDMI Signal: {self.signal_desc} (Locked)")
 
-                payload_len = width * height * 2
-                yuy2_slice = memoryview(self._shm_mmap)[yuy2_off : yuy2_off + payload_len]
+                out_w, out_h = self._preview_size(width, height)
+                use_scaled = out_w != width or out_h != height
+                yuy2_addr = _get_buffer_addr(frame.data)
+                qimg = None
 
-                post_seq = struct.unpack_from("<Q", self._shm_mmap, port_off)[0]
-                if post_seq != seq:
-                    return
+                if _lib_core is not None and yuy2_addr:
+                    scaled_fn = getattr(
+                        _lib_core, "everlive_yuy2_to_rgb_scaled", None)
+                    if use_scaled and scaled_fn is not None:
+                        self._ensure_rgb(out_w * out_h * 3)
+                        dst_addr = _get_buffer_addr(self._rgb_buffer)
+                        if dst_addr:
+                            scaled_fn(yuy2_addr, dst_addr, width, height,
+                                      out_w, out_h)
+                            qimg = QImage(
+                                self._rgb_buffer, out_w, out_h, out_w * 3,
+                                QImage.Format_RGB888).copy()
+                    if qimg is None:
+                        self._ensure_rgb(width * height * 3)
+                        dst_addr = _get_buffer_addr(self._rgb_buffer)
+                        if dst_addr:
+                            _lib_core.everlive_yuy2_to_rgb(
+                                yuy2_addr, dst_addr, width, height)
+                            qimg = QImage(
+                                self._rgb_buffer, width, height, width * 3,
+                                QImage.Format_RGB888).copy()
+                            if use_scaled:
+                                qimg = qimg.scaled(
+                                    out_w, out_h, Qt.IgnoreAspectRatio,
+                                    Qt.SmoothTransformation)
 
-
-                rgb_len = width * height * 3
-                if self._rgb_buffer is None or len(self._rgb_buffer) != rgb_len:
-                    self._rgb_buffer = bytearray(rgb_len)
-
-                yuy2_addr = _get_buffer_addr(yuy2_slice)
-                dst_addr = _get_buffer_addr(self._rgb_buffer)
-
-                if _lib_core is not None and yuy2_addr and dst_addr:
-                    _lib_core.everlive_yuy2_to_rgb(yuy2_addr, dst_addr, width, height)
-                    qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
-                elif HAS_NUMPY:
-                    raw = np.frombuffer(yuy2_slice, dtype=np.uint8).reshape((height, width, 2))
+                if qimg is None and HAS_NUMPY:
+                    raw = np.frombuffer(
+                        frame.data, dtype=np.uint8).reshape((height, width, 2))
                     y = raw[:, :, 0].astype(np.int32)
                     u = np.repeat(raw[:, 0::2, 1], 2, axis=1).astype(np.int32) - 128
                     v = np.repeat(raw[:, 1::2, 1], 2, axis=1).astype(np.int32) - 128
@@ -3278,33 +3332,46 @@ if HAS_QT:
                     g = np.clip(y - ((88 * u + 183 * v) >> 8), 0, 255).astype(np.uint8)
                     b = np.clip(y + ((454 * u) >> 8), 0, 255).astype(np.uint8)
                     rgb_arr = np.ascontiguousarray(np.dstack((r, g, b)))
-                    qimg = QImage(rgb_arr.data, width, height, width * 3, QImage.Format_RGB888).copy()
-                elif _lib_core is not None and dst_addr:
-                    src_copy = bytearray(yuy2_slice)
+                    qimg = QImage(
+                        rgb_arr.data, width, height, width * 3,
+                        QImage.Format_RGB888).copy()
+                    if use_scaled:
+                        qimg = qimg.scaled(
+                            out_w, out_h, Qt.IgnoreAspectRatio,
+                            Qt.SmoothTransformation)
+
+                if qimg is None and _lib_core is not None:
+                    self._ensure_rgb(width * height * 3)
+                    dst_addr = _get_buffer_addr(self._rgb_buffer)
+                    src_copy = bytearray(frame.data)
                     src_addr = _get_buffer_addr(src_copy)
-                    if src_addr:
-                        _lib_core.everlive_yuy2_to_rgb(src_addr, dst_addr, width, height)
-                        qimg = QImage(self._rgb_buffer, width, height, width * 3, QImage.Format_RGB888).copy()
-                    else:
-                        return
-                else:
+                    if src_addr and dst_addr:
+                        _lib_core.everlive_yuy2_to_rgb(
+                            src_addr, dst_addr, width, height)
+                        qimg = QImage(
+                            self._rgb_buffer, width, height, width * 3,
+                            QImage.Format_RGB888).copy()
+                        if use_scaled:
+                            qimg = qimg.scaled(
+                                out_w, out_h, Qt.IgnoreAspectRatio,
+                                Qt.SmoothTransformation)
+
+                if qimg is None:
                     return
 
-                self._last_seq = seq
+                # The producer may have recycled the slot while the conversion
+                # ran.  Discard the result rather than presenting a torn frame.
+                if not store.validate(frame):
+                    return
+
+                self._last_seq = frame.seq
                 self._current_qimage = qimg
                 self.update()
             except Exception as e:
                 if not getattr(self, "_logged_poll_err", False):
                     print(f"[EmbeddedVideoCanvas] poll_frame error: {e}")
                     self._logged_poll_err = True
-                if self._shm_mmap:
-                    try: self._shm_mmap.close()
-                    except Exception: pass
-                    self._shm_mmap = None
-                if self._shm_file:
-                    try: self._shm_file.close()
-                    except Exception: pass
-                    self._shm_file = None
+                self._close_store()
 
         def paintEvent(self, event):
             painter = QPainter(self)
@@ -4608,13 +4675,6 @@ if HAS_QT:
 
             h_sig_info.addLayout(v_sig_text, 1)
 
-            # Hidden dummy badge so legacy setText callers succeed without duplicate pill
-            self.lbl_audio_fmt = QLabel("")
-            self.lbl_audio_fmt.setVisible(False)
-
-            # Redundant engine badge removed; header's lbl_pill already indicates it
-            self.lbl_engine_badge = None
-
             v_video_col.addLayout(h_sig_info)
 
             # Embedded Live Video Feed Canvas (directly in layout, no enclosing container background)
@@ -5480,18 +5540,9 @@ if HAS_QT:
 
             return f"{res_str} • {fps_str} • {hdr_str} • {audio_label}"
 
-        @property
-        def is_pro_mode(self):
-            return self.is_advanced_mode
-
-        @is_pro_mode.setter
-        def is_pro_mode(self, val):
-            self.is_advanced_mode = val
-
         def toggle_advanced_mode(self):
             self.is_advanced_mode = not self.is_advanced_mode
             self._apply_advanced_mode()
-            self._update_framegen_button(self.saved_cfg.get("framegen_mode", "off"))
             save_settings({"ui_mode": "advanced" if self.is_advanced_mode else "simple"})
 
         def _apply_advanced_mode(self):
@@ -5500,12 +5551,6 @@ if HAS_QT:
             if hasattr(self, "btn_advanced"):
                 arrow = "▾" if self.is_advanced_mode else "▸"
                 self.btn_advanced.setText(f"Advanced Settings  {arrow}")
-
-        toggle_pro_mode = toggle_advanced_mode
-        _apply_pro_mode = _apply_advanced_mode
-
-        def _on_quick_preset_changed(self, index: int = 0):
-            pass
 
         def _set_launch_running(self, running: bool, mode: Optional[str] = None):
             if running:
@@ -5521,17 +5566,6 @@ if HAS_QT:
                     self.btn_detached.setText("⧉ Launch Detached SDL Window")
                 self.btn_detached.setStyle(self.btn_detached.style())
 
-            if getattr(self, "lbl_engine_badge", None):
-                if self._launch_mode == "detached":
-                    self.lbl_engine_badge.setText("Detached Window")
-                elif self._launch_mode == "gaming" or self.streamer.is_running:
-                    self.lbl_engine_badge.setText("Userspace VFIO")
-                elif self.vfio_mode:
-                    self.lbl_engine_badge.setText("Userspace VFIO")
-                elif self.vfio_mode:
-                    self.lbl_engine_badge.setText("Userspace VFIO")
-                else:
-                    self.lbl_engine_badge.setText("Direct Wayland (< 2ms)")
             self._update_vdev_label()
             self._update_tray_menu()
 
@@ -5619,8 +5653,6 @@ if HAS_QT:
         def _set_remote_ui(self, remote: bool):
             """Mirror the hub between local control and remote observation."""
             if remote:
-                if getattr(self, "lbl_engine_badge", None):
-                    self.lbl_engine_badge.setText("● Remote Session")
                 if hasattr(self, "btn_detached"):
                     self.btn_detached.setEnabled(False)
                 if hasattr(self, "combo_led"):
@@ -5630,8 +5662,6 @@ if HAS_QT:
                     "Attached to the userspace streamer that owns the card",
                     seconds=6.0)
             else:
-                if getattr(self, "lbl_engine_badge", None) and self.vfio_mode:
-                    self.lbl_engine_badge.setText("Userspace VFIO")
                 if hasattr(self, "btn_detached"):
                     self.btn_detached.setEnabled(True)
                 self._set_launch_running(False)
@@ -5655,9 +5685,6 @@ if HAS_QT:
 
             if not self._remote or self.streamer.is_running:
                 return
-
-            if hasattr(self, "lbl_audio_fmt"):
-                self.lbl_audio_fmt.setText(audio.get("label") or "No Audio")
 
             if signal_info.get("locked"):
                 self.lbl_hero_signal.setText(self.card_display_name)
@@ -5911,8 +5938,6 @@ if HAS_QT:
                 self._ipc.close()
             self.streamer.stop()
             self._set_launch_running(False)
-            if getattr(self, "lbl_engine_badge", None):
-                self.lbl_engine_badge.setText("Switching Mode…")
 
             if hasattr(self, "btn_detached"):
                 self.btn_detached.setEnabled(False)
@@ -6459,12 +6484,6 @@ if HAS_QT:
                     self.btn_framegen.setStyleSheet("")
                     self.btn_framegen.setToolTip("Frame generation is Off (native zero-latency path). Click to enable 60→120 FPS.")
 
-            if getattr(self, "_fullscreen_window", None) is not None:
-                try:
-                    self._fullscreen_window.update_framegen_visual(mode)
-                except Exception:
-                    pass
-
         def on_fg_perf_toggled(self, _enabled: bool):
             self._apply_framegen()
 
@@ -6795,8 +6814,6 @@ if HAS_QT:
                 self.lbl_pill.setText(ENGINE_VFIO_TEXT)
                 self.lbl_pill.setStyleSheet(
                     "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-                if hasattr(self, "lbl_audio_fmt"):
-                    self.lbl_audio_fmt.setText(self.streamer.audio_format_label())
                 return
 
             res = info.get("resolution", "No Signal")
@@ -6823,18 +6840,12 @@ if HAS_QT:
                 "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
             self.lbl_hero_signal.setText(self.card_display_name)
             self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
-            if hasattr(self, "lbl_audio_fmt"):
-                self.lbl_audio_fmt.setText("No Audio")
 
         def _update_status_vfio(self):
             if self._remote and not self.streamer.is_running:
                 # The remote streamer owns these values; its 1 Hz snapshot
                 # already drives the hero labels through _on_remote_status.
                 return
-            if hasattr(self, "lbl_audio_fmt"):
-                self.lbl_audio_fmt.setText(
-                    self.streamer.audio_format_label()
-                    if self.streamer.is_running else "No Audio")
 
             canvas_locked = bool(hasattr(self, "video_canvas") and self.video_canvas.has_signal)
             info = self.streamer.get_signal_info()
@@ -6948,10 +6959,6 @@ if HAS_QT:
 
             info = self.streamer.get_signal_info()
             self._live = info
-            if hasattr(self, "lbl_audio_fmt"):
-                self.lbl_audio_fmt.setText(
-                    info.get("audio", "No Audio")
-                    if info.get("locked") else "No Audio")
             if info["locked"]:
                 self._show_live(info)
             elif hasattr(self, "video_canvas") and self.video_canvas.has_signal:
@@ -7055,11 +7062,6 @@ if HAS_QT:
                     self._restore_from_tray()
 
         def _force_quit(self):
-            if hasattr(self, "recorder") and self.recorder.is_recording:
-                try:
-                    self.recorder.stop()
-                except Exception:
-                    pass
             try:
                 geo_hex = self.saveGeometry().toHex().data().decode("ascii")
                 save_settings({
@@ -7111,12 +7113,6 @@ if HAS_QT:
                         QSystemTrayIcon.Information,
                         3000)
                 return
-
-            if hasattr(self, "recorder") and self.recorder.is_recording:
-                try:
-                    self.recorder.stop()
-                except Exception:
-                    pass
 
             self._ipc_shutdown = True
             if self._ipc is not None:
