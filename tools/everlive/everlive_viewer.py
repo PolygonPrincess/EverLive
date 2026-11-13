@@ -29,11 +29,37 @@ except ImportError:
 
 try:
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from card_profile import (
+        detect_card_profile, CAP_FRAMEGEN, CAP_HDR, CAP_DUAL_INPUT,
+        CAP_RGB_LED,
+    )
     from framestore import FrameStore, FrameStoreError, open_store
+    from status_model import (
+        AudioSnapshot, EngineSnapshot, FramegenSnapshot, SignalSnapshot,
+        StatusSnapshot, merge_signal,
+    )
+    from theme import (
+        ACCENT, BORDER, COMBO_POPUP_QSS, DANGER, MAIN_QSS, OSD_QSS,
+        SUCCESS, SURFACE, SURFACE_RAISED, TEXT, TEXT_DIM, TEXT_MUTED,
+        TEXT_STRONG, WARNING,
+    )
 except ImportError:  # imported as a module from another working directory
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from card_profile import (
+        detect_card_profile, CAP_FRAMEGEN, CAP_HDR, CAP_DUAL_INPUT,
+        CAP_RGB_LED,
+    )
     from framestore import FrameStore, FrameStoreError, open_store
+    from status_model import (
+        AudioSnapshot, EngineSnapshot, FramegenSnapshot, SignalSnapshot,
+        StatusSnapshot, merge_signal,
+    )
+    from theme import (
+        ACCENT, BORDER, COMBO_POPUP_QSS, DANGER, MAIN_QSS, OSD_QSS,
+        SUCCESS, SURFACE, SURFACE_RAISED, TEXT, TEXT_DIM, TEXT_MUTED,
+        TEXT_STRONG, WARNING,
+    )
 
 __version__ = "1.5.0"
 
@@ -1193,6 +1219,10 @@ class GameStreamer:
         self.model = self.hw_info.get("model", MODEL_GC573)
         self.duo_mode = self.model == MODEL_GC570D
         self.model_label = MODEL_NAMES.get(self.model, MODEL_NAMES[MODEL_GC573])
+        # UI capabilities come from the card registry.  The model above still
+        # drives the actual engine path; EVERLIVE_CARD_PROFILE only changes the
+        # profile used by the Hub for synthetic layout testing.
+        self.card_profile = detect_card_profile()
         self.vfio_mode = self.mode == "vfio"
         self.kernel_mode = self.mode == "kernel"
 
@@ -3556,75 +3586,98 @@ if HAS_QT:
 
             self.osd_visible = True
             self.osd_user_hidden = False
+            self._status = None
 
             # Unified Top floating telemetry & controls overlay HUD
             self.osd_hud = QFrame(self)
+            self.osd_hud.setObjectName("osdHud")
             self.osd_hud.setFocusPolicy(Qt.NoFocus)
-            self.osd_hud.setStyleSheet("""
-                QFrame {
-                    background-color: rgba(14, 19, 29, 235);
-                    border: 1px solid #2a3448;
-                    border-radius: 10px;
-                }
-            """)
+            self.osd_hud.setStyleSheet(OSD_QSS)
             v_hud = QVBoxLayout(self.osd_hud)
             v_hud.setContentsMargins(16, 8, 16, 8)
             v_hud.setSpacing(5)
 
             h_hud_top = QHBoxLayout()
-            h_hud_top.setSpacing(10)
+            h_hud_top.setSpacing(8)
 
             self.lbl_hud_title = QLabel("EverLive Capture")
-            self.lbl_hud_title.setStyleSheet(
-                "color: #ffffff; font-weight: bold; font-size: 13px; border: none; background: transparent;")
+            self.lbl_hud_title.setObjectName("osdTitle")
             h_hud_top.addWidget(self.lbl_hud_title)
 
             self.lbl_hud_port = QLabel("● HDMI Live")
-            self.lbl_hud_port.setStyleSheet("""
-                background-color: rgba(13, 35, 24, 220);
-                color: #34d399;
-                border: 1px solid #164e32;
-                border-radius: 4px;
-                padding: 2px 8px;
-                font-size: 10px;
-                font-weight: bold;
-            """)
+            self.lbl_hud_port.setObjectName("osdChip")
             h_hud_top.addWidget(self.lbl_hud_port)
 
             h_hud_top.addStretch(1)
 
-
-            # Migrated action buttons directly in the top HUD
             self.btn_aspect = QPushButton("Aspect: AUTO (A)")
+            self.btn_aspect.setObjectName("osdAction")
             self.btn_aspect.setFocusPolicy(Qt.NoFocus)
             self.btn_aspect.setCursor(Qt.PointingHandCursor)
-            self.btn_aspect.setStyleSheet(
-                "background: #1a2030; color: #d7dde8; border: 1px solid #34425a; padding: 3px 9px; border-radius: 4px; font-weight: bold; font-size: 11px;")
             self.btn_aspect.clicked.connect(self._cycle_aspect)
             h_hud_top.addWidget(self.btn_aspect)
 
+            self.btn_scale = QPushButton("Scale: FIT (L)")
+            self.btn_scale.setObjectName("osdAction")
+            self.btn_scale.setFocusPolicy(Qt.NoFocus)
+            self.btn_scale.setCursor(Qt.PointingHandCursor)
+            self.btn_scale.clicked.connect(self._cycle_scale)
+            h_hud_top.addWidget(self.btn_scale)
+
+            self.btn_mute = QPushButton("Mute (M)")
+            self.btn_mute.setObjectName("osdAction")
+            self.btn_mute.setFocusPolicy(Qt.NoFocus)
+            self.btn_mute.setCursor(Qt.PointingHandCursor)
+            self.btn_mute.clicked.connect(self._toggle_mute)
+            h_hud_top.addWidget(self.btn_mute)
+
+            self.btn_framegen = None
+            if getattr(self.main_window.card_profile, "supports_framegen", False):
+                self.btn_framegen = QPushButton("Frame Gen: Off (G)")
+                self.btn_framegen.setObjectName("osdAction")
+                self.btn_framegen.setFocusPolicy(Qt.NoFocus)
+                self.btn_framegen.setCursor(Qt.PointingHandCursor)
+                self.btn_framegen.clicked.connect(
+                    self.main_window.toggle_framegen_quick)
+                h_hud_top.addWidget(self.btn_framegen)
+
             self.btn_toggle_osd = QPushButton("Hide OSD (Tab)")
+            self.btn_toggle_osd.setObjectName("osdAction")
             self.btn_toggle_osd.setFocusPolicy(Qt.NoFocus)
             self.btn_toggle_osd.setCursor(Qt.PointingHandCursor)
-            self.btn_toggle_osd.setStyleSheet(
-                "background: #1a2030; color: #8a94a6; border: 1px solid #2a3448; padding: 3px 9px; border-radius: 4px; font-size: 11px;")
             self.btn_toggle_osd.clicked.connect(self.toggle_osd)
             h_hud_top.addWidget(self.btn_toggle_osd)
 
             btn_exit = QPushButton("✕ Exit (Esc)")
+            btn_exit.setObjectName("osdExit")
             btn_exit.setFocusPolicy(Qt.NoFocus)
             btn_exit.setCursor(Qt.PointingHandCursor)
-            btn_exit.setStyleSheet(
-                "background: #2b4f6e; color: #ffffff; border: 1px solid #38658c; padding: 3px 11px; font-weight: bold; font-size: 11px; border-radius: 4px;")
             btn_exit.clicked.connect(self.close)
             h_hud_top.addWidget(btn_exit)
 
             v_hud.addLayout(h_hud_top)
 
             self.lbl_hud_meta = QLabel("Checking HDMI Signal...")
-            self.lbl_hud_meta.setStyleSheet(
-                "color: #7fd1ad; font-weight: bold; font-size: 11px; border: none; background: transparent;")
+            self.lbl_hud_meta.setObjectName("osdMeta")
             v_hud.addWidget(self.lbl_hud_meta)
+
+            self.lbl_hotkeys = QLabel(
+                "Tab OSD · F exit · A aspect · L scale · M mute · G framegen",
+                self)
+            self.lbl_hotkeys.setStyleSheet(
+                "color: rgba(203, 213, 225, 190); background: transparent; "
+                "font-size: 10px;")
+            self.lbl_hotkeys.setVisible(False)
+
+            self.lbl_toast = QLabel("", self)
+            self.lbl_toast.setStyleSheet(
+                "background-color: rgba(14, 19, 29, 225); color: #e6e9ef; "
+                "border: 1px solid #2a3448; border-radius: 6px; "
+                "padding: 5px 10px; font-size: 11px;")
+            self.lbl_toast.setVisible(False)
+            self._toast_timer = QTimer(self)
+            self._toast_timer.setSingleShot(True)
+            self._toast_timer.timeout.connect(self.lbl_toast.hide)
 
             self._hud_tick = 0
             self.rep_timer = QTimer(self)
@@ -3646,38 +3699,74 @@ if HAS_QT:
         def _sync_controls_state(self):
             pass
 
+        def set_status(self, snapshot):
+            """Render the same StatusSnapshot used by the main window."""
+            self._status = snapshot
+            self.lbl_hud_title.setText(snapshot.card_name)
+            if snapshot.signal.port is not None:
+                self.lbl_hud_port.setText(f"● HDMI {snapshot.signal.port + 1}")
+            elif snapshot.signal.locked:
+                self.lbl_hud_port.setText("● HDMI Live")
+            else:
+                self.lbl_hud_port.setText("○ Standby")
+            self.lbl_hud_meta.setText(snapshot.hero_subtitle())
+            self._update_hud_controls()
+
+        def _update_hud_controls(self):
+            aspect = getattr(self.canvas, "aspect", "auto").upper()
+            self.btn_aspect.setText(f"Aspect: {aspect} (A)")
+            scale = getattr(self.canvas, "scale_mode", "fit")
+            self.btn_scale.setText(
+                f"Scale: {'INTEGER' if scale == 'integer' else 'FIT'} (L)")
+            muted = bool(getattr(self.main_window, "muted", False))
+            self.btn_mute.setText("Unmute (M)" if muted else "Mute (M)")
+            if self.btn_framegen is not None:
+                mode = "off"
+                if self._status is not None:
+                    mode = self._status.framegen.mode or "off"
+                label = {
+                    "off": "Off",
+                    "60to120": "60→120",
+                    "30to60": "30→60",
+                }.get(mode, mode)
+                self.btn_framegen.setText(f"Frame Gen: {label} (G)")
+
         def _update_hud_telemetry(self):
             self._sync_controls_state()
-            card_name = getattr(self.main_window, "card_display_name", "EverLive Video Feed")
-            if hasattr(self, "lbl_hud_title"):
-                self.lbl_hud_title.setText(card_name)
+            if self._status is not None:
+                self.set_status(self._status)
+            else:
+                self._update_hud_controls()
 
-            if hasattr(self, "lbl_hud_port"):
-                if getattr(self.main_window, "duo_mode", False):
-                    port_idx = getattr(self.canvas, "port", 0)
-                    self.lbl_hud_port.setText(f"● HDMI {port_idx + 1}")
-                else:
-                    self.lbl_hud_port.setText("● HDMI Live")
+        def _cycle_scale(self):
+            order = ["fit", "integer"]
+            current = getattr(self.canvas, "scale_mode", "fit")
+            target = order[(order.index(current) + 1) % len(order)] \
+                if current in order else "fit"
+            self.canvas.set_scale_mode(target)
+            if hasattr(self.main_window, "combo_scale"):
+                idx = self.main_window.combo_scale.findData(target)
+                if idx >= 0:
+                    self.main_window.combo_scale.blockSignals(True)
+                    self.main_window.combo_scale.setCurrentIndex(idx)
+                    self.main_window.combo_scale.blockSignals(False)
+            self._update_hud_controls()
 
-            meta_text = ""
-            if hasattr(self.main_window, "_format_signal_subtitle"):
-                try:
-                    meta_text = self.main_window._format_signal_subtitle()
-                except Exception:
-                    meta_text = ""
-            if not meta_text:
-                if self.canvas.has_signal:
-                    meta_text = f"{self.canvas.current_width}×{self.canvas.current_height} • 60 FPS • SDR • Audio Active"
-                else:
-                    meta_text = "No HDMI Signal • Waiting for input"
+        def _toggle_mute(self):
+            self.main_window.toggle_mute()
+            self._update_hud_controls()
 
-            aspect = getattr(self.canvas, "aspect", "auto").upper()
-            full_meta = f"{meta_text}   •   Aspect: {aspect}"
-            if hasattr(self, "lbl_hud_meta"):
-                self.lbl_hud_meta.setText(full_meta)
+        def show_toast(self, message: str, duration: float = 3.0):
+            self.lbl_toast.setText(str(message))
+            self.lbl_toast.adjustSize()
+            self._position_toast()
+            self.lbl_toast.setVisible(True)
+            self._toast_timer.start(max(500, int(duration * 1000)))
 
-            if hasattr(self, "btn_aspect"):
-                self.btn_aspect.setText(f"Aspect: {aspect} (A)")
+        def _position_toast(self):
+            margin = 24
+            self.lbl_toast.move(
+                margin, self.height() - self.lbl_toast.height() - margin)
 
         def _cycle_aspect(self):
             order = ["auto", "16:9", "4:3", "stretch"]
@@ -3705,6 +3794,7 @@ if HAS_QT:
                 self.osd_user_hidden = True
             if hasattr(self, "osd_hud"):
                 self.osd_hud.setVisible(False)
+            self.lbl_hotkeys.setVisible(False)
             self.setCursor(Qt.BlankCursor)
 
         def _show_osd(self, user_initiated: bool = False):
@@ -3714,6 +3804,7 @@ if HAS_QT:
             self._update_hud_telemetry()
             if hasattr(self, "osd_hud"):
                 self.osd_hud.setVisible(True)
+                self.lbl_hotkeys.setVisible(True)
             self.unsetCursor()
             self.cursor_timer.start(3500)
 
@@ -3750,6 +3841,16 @@ if HAS_QT:
             elif key == Qt.Key_A:
                 self._cycle_aspect()
                 event.accept()
+            elif key == Qt.Key_L:
+                self._cycle_scale()
+                event.accept()
+            elif key == Qt.Key_M:
+                self._toggle_mute()
+                event.accept()
+            elif key == Qt.Key_G and self.btn_framegen is not None:
+                self.main_window.toggle_framegen_quick()
+                self._update_hud_controls()
+                event.accept()
             else:
                 super().keyPressEvent(event)
 
@@ -3764,6 +3865,11 @@ if HAS_QT:
             hud_w = min(max(920, hint.width() + 24), w - 40)
             hud_h = max(66, hint.height() + 8)
             self.osd_hud.setGeometry((w - hud_w) // 2, 20, hud_w, hud_h)
+            self.lbl_hotkeys.adjustSize()
+            self.lbl_hotkeys.move(
+                w - self.lbl_hotkeys.width() - 24,
+                h - self.lbl_hotkeys.height() - 20)
+            self._position_toast()
 
         def paintEvent(self, event):
             painter = QPainter(self)
@@ -3824,6 +3930,10 @@ if HAS_QT:
             self.vfio_mode = streamer.vfio_mode
             self.duo_mode = getattr(streamer, "duo_mode", False)
             self.model = getattr(streamer, "model", MODEL_GC573)
+            self.card_profile = getattr(
+                streamer, "card_profile", detect_card_profile(self.model))
+            self.ui_duo = self.card_profile.supports_dual_input
+            self.status = StatusSnapshot(card=self.card_profile)
             self.enable_vsync = vsync
             self.muted = False
             self.saved_cfg = load_settings()
@@ -3887,8 +3997,8 @@ if HAS_QT:
             # Auto-attach to already running capture engine or start automatically on launch
             if _vfio_streamer_running():
                 self.streamer.is_running = True
-                self._launch_mode = "gaming"
                 self._vfio_live = True
+                self._set_launch_running(True, "gaming")
                 print("[*] Userspace capture engine already active; attaching live feed.")
             elif headless_start:
                 QTimer.singleShot(150, self.start_studio)
@@ -3901,30 +4011,7 @@ if HAS_QT:
             """Applies consistent 32px height, combobox-popup:0, and solid opaque popup list view."""
             cb.setFixedHeight(32)
             view = QListView(cb)
-            view.setStyleSheet("""
-                QListView {
-                    background-color: #151a24;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3548;
-                    border-radius: 6px;
-                    outline: none;
-                    padding: 4px;
-                }
-                QListView::item {
-                    min-height: 28px;
-                    padding: 4px 10px;
-                    border-radius: 4px;
-                    color: #e6e9ef;
-                }
-                QListView::item:hover {
-                    background-color: #212a3a;
-                    color: #ffffff;
-                }
-                QListView::item:selected {
-                    background-color: #2b4f6e;
-                    color: #ffffff;
-                }
-            """)
+            view.setStyleSheet(COMBO_POPUP_QSS)
             cb.setView(view)
 
         def init_ui(self):
@@ -3966,622 +4053,7 @@ if HAS_QT:
                 self.setWindowIcon(QIcon(icon_path))
 
             # EverLive Clean Dark Studio Theme
-            self.setStyleSheet("""
-                QMainWindow {
-                    background-color: #0b0d13;
-                }
-                QFrame#cardFrame {
-                    background-color: #12151f;
-                    border: 1px solid #1f2537;
-                    border-radius: 8px;
-                    padding: 14px;
-                }
-                QFrame#bottomBar {
-                    background-color: #080a0e;
-                    border-top: 1px solid #171b26;
-                    padding: 5px 12px;
-                }
-                QLabel {
-                    color: #e2e8f0;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                }
-                QLabel#logoTitle {
-                    color: #ffffff;
-                    font-size: 15px;
-                    font-weight: 700;
-                    letter-spacing: 0.5px;
-                }
-                QLabel#logoVersion {
-                    color: #64748b;
-                    font-size: 11px;
-                    font-weight: 500;
-                }
-                QLabel#badgeModel {
-                    color: #94a3b8;
-                    background-color: #1a202c;
-                    border: 1px solid #2d3748;
-                    border-radius: 4px;
-                    padding: 2px 7px;
-                    font-size: 10px;
-                    font-weight: 600;
-                    letter-spacing: 0.5px;
-                }
-                QLabel#pillLive {
-                    border-radius: 12px;
-                    padding: 4px 12px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QLabel#sectionTitle {
-                    color: #64748b;
-                    font-size: 11px;
-                    font-weight: 700;
-                    letter-spacing: 0.8px;
-                }
-                QLabel#heroSignal {
-                    color: #ffffff;
-                    font-size: 18px;
-                    font-weight: 700;
-                    padding-bottom: 3px;
-                    min-height: 26px;
-                }
-                QLabel#heroMeta {
-                    color: #94a3b8;
-                    font-size: 12px;
-                    padding-bottom: 2px;
-                    min-height: 18px;
-                }
-                QLabel#engineBadge {
-                    background-color: #0d2318;
-                    color: #34d399;
-                    border: 1px solid #164e32;
-                    border-radius: 4px;
-                    padding: 3px 8px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QComboBox {
-                    background-color: #171b26;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3348;
-                    border-radius: 6px;
-                    padding: 6px 10px;
-                    font-size: 12px;
-                    min-height: 22px;
-                }
-                QComboBox:hover {
-                    border-color: #3b82f6;
-                }
-                QComboBox::drop-down {
-                    border: none;
-                    width: 20px;
-                }
-                QDoubleSpinBox {
-                    background-color: #171b26;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3348;
-                    border-radius: 6px;
-                    padding: 6px 10px;
-                    font-size: 12px;
-                    min-height: 22px;
-                }
-                QDoubleSpinBox QLineEdit {
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    background: transparent;
-                    color: #f1f5f9;
-                    border: none;
-                }
-                QCheckBox {
-                    color: #94a3b8;
-                    font-size: 12px;
-                    spacing: 8px;
-                }
-                QCheckBox:hover {
-                    color: #f1f5f9;
-                }
-                QCheckBox::indicator {
-                    width: 15px;
-                    height: 15px;
-                    border-radius: 3px;
-                    border: 1px solid #2d3748;
-                    background-color: #171b26;
-                }
-                QCheckBox::indicator:hover {
-                    border-color: #3b82f6;
-                }
-                QCheckBox::indicator:checked {
-                    background-color: #2563eb;
-                    border-color: #3b82f6;
-                }
-                QPushButton {
-                    background-color: #1a202c;
-                    color: #e2e8f0;
-                    border: 1px solid #2d3748;
-                    border-radius: 6px;
-                    padding: 6px 14px;
-                    font-size: 12px;
-                    font-weight: 500;
-                }
-                QPushButton:hover {
-                    background-color: #252d3d;
-                    border-color: #3b82f6;
-                }
-                QPushButton:pressed {
-                    background-color: #141822;
-                }
-                QPushButton#btnDiscord {
-                    background-color: #5865F2;
-                    color: #ffffff;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 4px 10px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QPushButton#btnDiscord:hover {
-                    background-color: #4752c4;
-                }
-                QPushButton#btnMute {
-                    background-color: #1a202c;
-                    color: #e2e8f0;
-                    border: 1px solid #2d3748;
-                    border-radius: 5px;
-                    padding: 4px 6px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QPushButton#btnMute:hover {
-                    background-color: #252d3d;
-                    border-color: #3b82f6;
-                }
-                QPushButton#btnLaunchStart {
-                    background-color: #10b981;
-                    color: #ffffff;
-                    border: none;
-                    font-size: 14px;
-                    font-weight: 600;
-                    border-radius: 6px;
-                    padding: 11px 18px;
-                }
-                QPushButton#btnLaunchStart:hover {
-                    background-color: #059669;
-                }
-                QPushButton#btnLaunchStop {
-                    background-color: #ef4444;
-                    color: #ffffff;
-                    border: none;
-                    font-size: 14px;
-                    font-weight: 600;
-                    border-radius: 6px;
-                    padding: 11px 18px;
-                }
-                QPushButton#btnLaunchStop:hover {
-                    background-color: #dc2626;
-                }
-                QPushButton#btnStudioStart {
-                    background-color: #1d4ed8;
-                    color: #ffffff;
-                    border: none;
-                    font-size: 13px;
-                    font-weight: 600;
-                    border-radius: 6px;
-                    padding: 9px 16px;
-                }
-                QPushButton#btnStudioStart:hover {
-                    background-color: #2563eb;
-                }
-                QPushButton#btnStudioStop {
-                    background-color: #ef4444;
-                    color: #ffffff;
-                    border: none;
-                    font-size: 13px;
-                    font-weight: 600;
-                    border-radius: 6px;
-                    padding: 9px 16px;
-                }
-                QPushButton#btnStudioStop:hover {
-                    background-color: #dc2626;
-                }
-                QPushButton#btnLaunchSwitch, QPushButton#btnStudioSwitch {
-                    background-color: #0891b2;
-                    color: #ffffff;
-                    border: none;
-                    font-weight: 600;
-                    border-radius: 6px;
-                }
-                QPushButton#btnLaunchSwitch {
-                    font-size: 14px;
-                    padding: 11px 18px;
-                }
-                QPushButton#btnStudioSwitch {
-                    font-size: 13px;
-                    padding: 9px 16px;
-                }
-                QPushButton#btnLaunchSwitch:hover, QPushButton#btnStudioSwitch:hover {
-                    background-color: #06b6d4;
-                }
-                QPushButton#btnLaunchSwitch:pressed, QPushButton#btnStudioSwitch:pressed {
-                    background-color: #0e7490;
-                }
-                QPushButton#btnLaunchSwitch:disabled, QPushButton#btnStudioSwitch:disabled {
-                    background-color: #334155;
-                    color: #94a3b8;
-                }
-                QLabel#audioFormat {
-                    color: #34d399;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QSlider::groove:horizontal {
-                    height: 4px;
-                    background: #1e2537;
-                    border-radius: 2px;
-                }
-                QSlider::sub-page:horizontal {
-                    background: #3b82f6;
-                    border-radius: 2px;
-                }
-                QSlider::handle:horizontal {
-                    background: #e2e8f0;
-                    width: 14px;
-                    margin-top: -5px;
-                    margin-bottom: -5px;
-                    border-radius: 7px;
-                }
-                QSlider::handle:horizontal:hover {
-                    background: #ffffff;
-                }
-
-                /* -----------------------------------------------------
-                 * Layout refresh: calm hardware-console palette.
-                 * These rules come last on purpose and override the
-                 * legacy neon palette above without touching behaviour.
-                 * ----------------------------------------------------- */
-                QMainWindow { background-color: #0e1116; }
-                QLabel { color: #e6e9ef; font-size: 12px; }
-                QFrame#cardFrame {
-                    background-color: #151a23;
-                    border: 1px solid #232a37;
-                    border-radius: 10px;
-                }
-                QFrame#bottomBar {
-                    background: transparent;
-                    border: none;
-                }
-                QLabel#logoTitle {
-                    font-size: 14px;
-                    font-weight: 700;
-                    letter-spacing: 0.6px;
-                    color: #f2f4f8;
-                }
-                QLabel#logoVersion { color: #6b7488; font-size: 11px; }
-                QLabel#badgeModel {
-                    color: #9aa3b5;
-                    background-color: #1a2030;
-                    border: 1px solid #2a3242;
-                    border-radius: 5px;
-                    padding: 0px 9px;
-                    font-size: 10px;
-                    font-weight: 600;
-                    letter-spacing: 0.6px;
-                }
-                QLabel#pillLive {
-                    border-radius: 14px;
-                    padding: 0px 12px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QLabel#sectionTitle {
-                    color: #6b7488;
-                    font-size: 10px;
-                    font-weight: 700;
-                    letter-spacing: 1.0px;
-                }
-                QLabel#fieldLabel { color: #8b93a7; font-size: 12px; }
-                QLabel#heroSignal {
-                    color: #f2f4f8;
-                    font-size: 20px;
-                    font-weight: 600;
-                    padding-bottom: 4px;
-                    min-height: 28px;
-                }
-                QLabel#heroMeta {
-                    color: #8b93a7;
-                    font-size: 12px;
-                    padding-bottom: 2px;
-                    min-height: 18px;
-                }
-                QLabel#engineBadge {
-                    background-color: #12261f;
-                    color: #8fd6b4;
-                    border: 1px solid #1d4034;
-                    border-radius: 5px;
-                    padding: 0px 10px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QLabel#audioFormat {
-                    color: #a9c7dd;
-                    background-color: #16202c;
-                    border: 1px solid #243447;
-                    border-radius: 6px;
-                    padding: 0px 9px;
-                    font-size: 11px;
-                    font-weight: 600;
-                }
-                QLabel#footerText { color: #5f6878; font-size: 11px; }
-
-                QComboBox {
-                    combobox-popup: 0;
-                    min-height: 22px;
-                    max-height: 22px;
-                    padding: 4px 10px;
-                    font-size: 12px;
-                    background-color: #171b26;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3348;
-                    border-radius: 6px;
-                }
-                QComboBox:hover {
-                    border-color: #3b82f6;
-                }
-                QComboBox::drop-down {
-                    border: none;
-                    width: 22px;
-                }
-                QComboBox QAbstractItemView, QComboBox QListView {
-                    background-color: #151a24;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3548;
-                    border-radius: 6px;
-                    selection-background-color: #2b4f6e;
-                    selection-color: #ffffff;
-                    outline: none;
-                    padding: 4px;
-                }
-                QComboBox QAbstractItemView::item, QComboBox QListView::item {
-                    min-height: 28px;
-                    padding: 4px 10px;
-                    border-radius: 4px;
-                    color: #e6e9ef;
-                    background-color: transparent;
-                }
-                QComboBox QAbstractItemView::item:hover, QComboBox QListView::item:hover {
-                    background-color: #212a3a;
-                    color: #ffffff;
-                }
-                QComboBox QAbstractItemView::item:selected, QComboBox QListView::item:selected {
-                    background-color: #2b4f6e;
-                    color: #ffffff;
-                }
-
-                QToolTip {
-                    background-color: #151a24;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3548;
-                    border-radius: 5px;
-                    padding: 5px 8px;
-                    font-size: 11px;
-                    opacity: 255;
-                }
-
-                QMenu {
-                    background-color: #151a24;
-                    color: #f1f5f9;
-                    border: 1px solid #2b3548;
-                    border-radius: 6px;
-                    padding: 4px;
-                }
-                QMenu::item {
-                    padding: 6px 14px;
-                    border-radius: 4px;
-                    color: #e6e9ef;
-                }
-                QMenu::item:selected {
-                    background-color: #2b4f6e;
-                    color: #ffffff;
-                }
-                QMenu::separator {
-                    height: 1px;
-                    background-color: #232a37;
-                    margin: 4px 8px;
-                }
-
-                QLineEdit, QSpinBox, QDoubleSpinBox {
-                    min-height: 22px;
-                    max-height: 22px;
-                    padding: 4px 10px;
-                    font-size: 12px;
-                    background-color: #171d29;
-                    color: #e6e9ef;
-                    border: 1px solid #2a3242;
-                    border-radius: 6px;
-                }
-                QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #3a465e; }
-                QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #4b6ea8; }
-                QDoubleSpinBox QLineEdit {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    background: transparent;
-                    color: #e6e9ef;
-                    border: none;
-                }
-                QDoubleSpinBox:disabled {
-                    color: #5f6878;
-                    background-color: #121722;
-                }
-                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                    subcontrol-origin: border;
-                    width: 0px;
-                    border: none;
-                }
-                QPushButton#btnStepper {
-                    padding: 0px;
-                    min-height: 30px;
-                    max-height: 30px;
-                    font-size: 15px;
-                    font-weight: 600;
-                    background-color: #1a2030;
-                    color: #d7dde8;
-                    border: 1px solid #2a3242;
-                    border-radius: 6px;
-                }
-                QPushButton#btnStepper:hover {
-                    background-color: #232c3f;
-                    border-color: #3a465e;
-                    color: #ffffff;
-                }
-                QPushButton#btnStepper:pressed {
-                    background-color: #151b28;
-                }
-                QPushButton#btnStepper:disabled {
-                    background-color: #121722;
-                    color: #4b5363;
-                    border-color: #1f2633;
-                }
-
-                QPushButton#btnCustomLed {
-                    padding: 0px;
-                    min-height: 30px;
-                    max-height: 30px;
-                }
-
-                QPushButton#btnMute {
-                    padding: 0px;
-                    min-height: 30px;
-                    max-height: 30px;
-                }
-
-                QPushButton#btnFgRecheck {
-                    padding: 0px 8px;
-                    min-height: 22px;
-                    max-height: 22px;
-                }
-
-                QPushButton {
-                    min-height: 22px;
-                    max-height: 22px;
-                    padding: 4px 14px;
-                    font-size: 12px;
-                    font-weight: 500;
-                    border-radius: 6px;
-                    background-color: #1a2030;
-                    color: #e6e9ef;
-                    border: 1px solid #2a3242;
-                }
-                QPushButton:hover {
-                    background-color: #212a3a;
-                    border-color: #3a465e;
-                }
-                QPushButton:pressed { background-color: #151b28; }
-                QPushButton:disabled { color: #5f6878; border-color: #232a37; }
-
-                QPushButton#btnGhost {
-                    background-color: transparent;
-                    color: #9aa3b5;
-                    border: 1px solid #2a3242;
-                    font-weight: 500;
-                }
-                QPushButton#btnGhost:hover {
-                    background-color: #1a2030;
-                    color: #e6e9ef;
-                    border-color: #3a465e;
-                }
-
-                QPushButton#btnAdvancedExpand {
-                    background-color: #141822;
-                    color: #cbd5e1;
-                    border: 1px solid #222938;
-                    border-radius: 6px;
-                    font-size: 11px;
-                    font-weight: 600;
-                    padding: 4px 12px;
-                    text-align: left;
-                    min-height: 22px;
-                    max-height: 22px;
-                }
-                QPushButton#btnAdvancedExpand:hover {
-                    background-color: #1c2230;
-                    color: #ffffff;
-                    border-color: #3b82f6;
-                }
-
-                QPushButton#btnLaunchStart {
-                    background-color: #2f7d63;
-                    border: 1px solid #3a9174;
-                    color: #ffffff;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
-                QPushButton#btnLaunchStart:hover { background-color: #378d71; }
-
-                QPushButton#btnLaunchStop {
-                    background-color: #a83f3a;
-                    border: 1px solid #bd4a44;
-                    color: #ffffff;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
-                QPushButton#btnLaunchStop:hover { background-color: #b64a44; }
-
-                QPushButton#btnStudioStart,
-                QPushButton#btnStudioSwitch {
-                    background-color: transparent;
-                    border: 1px solid #34425a;
-                    color: #b9c4d6;
-                    font-size: 12px;
-                    font-weight: 600;
-                }
-                QPushButton#btnStudioStart:hover,
-                QPushButton#btnStudioSwitch:hover {
-                    background-color: #1a2030;
-                    border-color: #46587a;
-                    color: #e6e9ef;
-                }
-
-                QPushButton#btnLaunchSwitch {
-                    background-color: #2b4f6e;
-                    border: 1px solid #38658c;
-                    color: #eaf2fa;
-                    font-size: 13px;
-                    font-weight: 600;
-                }
-                QPushButton#btnLaunchSwitch:hover { background-color: #326087; }
-
-                QPushButton#btnStudioStop {
-                    background-color: #a83f3a;
-                    border: 1px solid #bd4a44;
-                    color: #ffffff;
-                    font-size: 12px;
-                    font-weight: 600;
-                }
-                QPushButton#btnStudioStop:hover { background-color: #b64a44; }
-
-                QCheckBox { color: #b9c0cf; font-size: 12px; spacing: 8px; }
-                QCheckBox:hover { color: #e6e9ef; }
-                QCheckBox:disabled { color: #5f6878; }
-                QCheckBox::indicator {
-                    width: 15px; height: 15px;
-                    border-radius: 4px;
-                    border: 1px solid #34425a;
-                    background-color: #171d29;
-                }
-                QCheckBox::indicator:hover { border-color: #4b6ea8; }
-                QCheckBox::indicator:checked {
-                    background-color: #2f7d63;
-                    border-color: #3a9174;
-                }
-                QSlider::sub-page:horizontal { background: #3f9d7f; }
-                QSlider::handle:horizontal {
-                    background: #d7dde8;
-                    width: 14px;
-                    margin-top: -5px;
-                    margin-bottom: -5px;
-                    border-radius: 7px;
-                }
-                QSlider::handle:horizontal:hover { background: #ffffff; }
-            """)
+            self.setStyleSheet(MAIN_QSS)
 
             central_widget = QWidget()
             self.setCentralWidget(central_widget)
@@ -4685,7 +4157,7 @@ if HAS_QT:
             self.video_canvas.set_port(saved_input)
             self.video_canvas.fullscreen_requested.connect(self.toggle_fullscreen)
             self.video_canvas.toggle_play_requested.connect(self.toggle_stream)
-            if self.duo_mode:
+            if self.ui_duo:
                 self.video_canvas.port_requested.connect(
                     lambda p: self.combo_duo_input.setCurrentIndex(1 if p == 1 else 0) if hasattr(self, "combo_duo_input") else None)
             v_video_col.addWidget(self.video_canvas, 1)
@@ -4740,7 +4212,34 @@ if HAS_QT:
             v_side.addWidget(lbl_side_title)
             v_side.addSpacing(12)
 
-            if self.duo_mode:
+            h_actions = QHBoxLayout()
+            h_actions.setSpacing(8)
+            self.btn_launch = QPushButton("Start Gaming")
+            self.btn_launch.setObjectName("btnLaunchStart")
+            self.btn_launch.setCursor(Qt.PointingHandCursor)
+            self.btn_launch.setMinimumHeight(36)
+            self.btn_launch.setToolTip(
+                "Start the interactive preview and capture engine.")
+            self.btn_launch.clicked.connect(self.toggle_stream)
+            h_actions.addWidget(self.btn_launch, 3)
+
+            self.btn_studio = QPushButton("Studio")
+            self.btn_studio.setObjectName("btnStudioStart")
+            self.btn_studio.setCursor(Qt.PointingHandCursor)
+            self.btn_studio.setMinimumHeight(36)
+            self.btn_studio.setToolTip(
+                "Run headless and publish native frames to PipeWire, the "
+                "shared frame store, and optional V4L2 for OBS/Discord.")
+            self.btn_studio.clicked.connect(self.toggle_studio)
+            if not self.vfio_mode:
+                self.btn_studio.setEnabled(False)
+                self.btn_studio.setToolTip(
+                    "Studio / headless mode requires the userspace VFIO engine.")
+            h_actions.addWidget(self.btn_studio, 2)
+            v_side.addLayout(h_actions)
+            v_side.addSpacing(16)
+
+            if self.ui_duo:
                 lbl_duo_hdr = QLabel("DUO INPUT")
                 lbl_duo_hdr.setObjectName("sectionTitle")
                 lbl_duo_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
@@ -4851,7 +4350,7 @@ if HAS_QT:
             self.combo_audio_channels.setCurrentIndex(idx if idx >= 0 else 0)
             self.combo_audio_channels.currentIndexChanged.connect(
                 self.on_audio_channels_changed)
-            if self.duo_mode:
+            if self.ui_duo:
                 self.combo_audio_channels.setEnabled(False)
                 self.combo_audio_channels.setToolTip(
                     "The Live Gamer DUO engine publishes stereo only.")
@@ -4931,6 +4430,29 @@ if HAS_QT:
             v_side.addLayout(h_led)
             v_side.addSpacing(16)
 
+            if self.card_profile.supports_framegen:
+                lbl_fg_hdr = QLabel("FRAME GENERATION")
+                lbl_fg_hdr.setObjectName("sectionTitle")
+                lbl_fg_hdr.setStyleSheet(
+                    "font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
+                v_side.addWidget(lbl_fg_hdr)
+                v_side.addSpacing(6)
+
+                self.btn_framegen = QPushButton(
+                    "Frame Generation (LSFG): Off")
+                self.btn_framegen.setObjectName("btnGhost")
+                self.btn_framegen.setFixedHeight(32)
+                self.btn_framegen.setCursor(Qt.PointingHandCursor)
+                self.btn_framegen.setToolTip(
+                    "Cycle Off → 60→120 FPS → 30→60 FPS. "
+                    "Requires the lsfg-vk Vulkan layer.")
+                self.btn_framegen.clicked.connect(
+                    self.toggle_framegen_quick)
+                v_side.addWidget(self.btn_framegen)
+                v_side.addSpacing(16)
+                self._update_framegen_button(
+                    self.saved_cfg.get("framegen_mode", "off"))
+
             lbl_eng_hdr = QLabel("CAPTURE ENGINE")
             lbl_eng_hdr.setObjectName("sectionTitle")
             lbl_eng_hdr.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px;")
@@ -4958,7 +4480,6 @@ if HAS_QT:
             self.btn_advanced.setCursor(Qt.PointingHandCursor)
             self.btn_advanced.setToolTip("Expand or collapse advanced hardware EDID, frame generation, OBS, and app options")
             self.btn_advanced.clicked.connect(self.toggle_advanced_mode)
-            self.btn_pro_mode = self.btn_advanced
             v_side.addWidget(self.btn_advanced)
             v_side.addSpacing(14)
 
@@ -4972,16 +4493,46 @@ if HAS_QT:
             # -------------------------------------------------------------
             # Settings: three calm, thematically grouped sections
             # -------------------------------------------------------------
-            def _section(title):
+            saved_sections = self.saved_cfg.get("advanced_sections") or {}
+
+            def _section(title, key):
                 frame = QWidget()
                 frame.setStyleSheet("background: transparent;")
-                lay = QVBoxLayout(frame)
+                outer = QVBoxLayout(frame)
+                outer.setContentsMargins(0, 0, 0, 0)
+                outer.setSpacing(0)
+
+                expanded = bool(saved_sections.get(key, True))
+                head = QPushButton(
+                    f"{title}  {'▾' if expanded else '▸'}")
+                head.setCheckable(True)
+                head.setChecked(expanded)
+                head.setCursor(Qt.PointingHandCursor)
+                head.setStyleSheet(
+                    "QPushButton { text-align: left; background: transparent; "
+                    "border: none; color: #64748b; font-size: 10px; "
+                    "font-weight: 700; letter-spacing: 0.5px; "
+                    "padding: 4px 0px 6px 0px; }"
+                    "QPushButton:hover { color: #94a3b8; }")
+                outer.addWidget(head)
+
+                body = QWidget()
+                body.setStyleSheet("background: transparent;")
+                lay = QVBoxLayout(body)
                 lay.setContentsMargins(0, 0, 0, 0)
                 lay.setSpacing(0)
-                head = QLabel(title)
-                head.setObjectName("sectionTitle")
-                head.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 700; letter-spacing: 0.5px; padding-top: 4px; padding-bottom: 6px;")
-                lay.addWidget(head)
+                body.setVisible(expanded)
+                outer.addWidget(body)
+
+                def _toggle(checked, _title=title, _key=key):
+                    body.setVisible(checked)
+                    head.setText(f"{_title}  {'▾' if checked else '▸'}")
+                    current = load_settings().get("advanced_sections") or {}
+                    current = dict(current)
+                    current[_key] = bool(checked)
+                    save_settings({"advanced_sections": current})
+
+                head.toggled.connect(_toggle)
                 return frame, lay
 
             def _field(text, tip=""):
@@ -4992,7 +4543,7 @@ if HAS_QT:
                 return lbl
 
             # --- Section A: video & color -------------------------------
-            card_video, lay_video = _section("VIDEO & COLOR")
+            card_video, lay_video = _section("VIDEO & COLOR", "video")
 
             lay_video.addWidget(_field(
                 "Hardware EDID Profile" if self.vfio_mode else "Format / Preset"))
@@ -5000,7 +4551,7 @@ if HAS_QT:
 
             self.combo_presets = QComboBox()
             self._style_combobox(self.combo_presets)
-            if self.duo_mode:
+            if self.ui_duo:
                 duo_formats = [
                     ("Auto (HDMI Native Sync)", "auto"),
                     ("1080p @ 60 FPS (1920×1080)", "1080p60"),
@@ -5079,11 +4630,16 @@ if HAS_QT:
             lay_video.addWidget(self.combo_aspect)
             lay_video.addSpacing(12)
 
-            lay_video.addWidget(_field(
+            hdr_box = QWidget()
+            v_hdr = QVBoxLayout(hdr_box)
+            v_hdr.setContentsMargins(0, 0, 0, 0)
+            v_hdr.setSpacing(0)
+
+            v_hdr.addWidget(_field(
                 "HDR Tonemapping",
                 "Maps BT.2020 PQ/HLG signals to BT.709 SDR for both the "
                 "gaming window and the OBS loopback feed (hotkey: H)."))
-            lay_video.addSpacing(6)
+            v_hdr.addSpacing(6)
 
             self.chk_hdr = QCheckBox("HDR10 / HLG → SDR")
             self.chk_hdr.setChecked(bool(self.saved_cfg.get("hdr_tonemap", True)))
@@ -5091,20 +4647,20 @@ if HAS_QT:
                 "Forwarded as --no-hdr when unchecked. Applies live over IPC "
                 "while the engine runs.")
             self.chk_hdr.toggled.connect(self.on_hdr_toggled)
-            lay_video.addWidget(self.chk_hdr)
-            lay_video.addSpacing(4)
+            v_hdr.addWidget(self.chk_hdr)
+            v_hdr.addSpacing(4)
 
             self.chk_hdr_passthrough = QCheckBox("Passthrough")
             self.chk_hdr_passthrough.setChecked(bool(self.saved_cfg.get("hdr_passthrough", False)))
             self.chk_hdr_passthrough.setToolTip(
                 "Direct BT.2020 PQ/HLG passthrough to HDR-capable displays (bypasses SDR tonemapping).")
             self.chk_hdr_passthrough.toggled.connect(self.on_hdr_passthrough_toggled)
-            lay_video.addWidget(self.chk_hdr_passthrough)
-            lay_video.addSpacing(12)
+            v_hdr.addWidget(self.chk_hdr_passthrough)
+            v_hdr.addSpacing(12)
 
-            lay_video.addWidget(_field(
+            v_hdr.addWidget(_field(
                 "Exposure", "Linear exposure bias (-2.0 .. +2.0 EV)."))
-            lay_video.addSpacing(4)
+            v_hdr.addSpacing(4)
 
             h_exposure = QHBoxLayout()
             h_exposure.setContentsMargins(0, 0, 0, 0)
@@ -5152,7 +4708,9 @@ if HAS_QT:
                 self.spin_hdr_exposure.stepUp)
             h_exposure.addWidget(self.btn_hdr_exp_plus)
 
-            lay_video.addLayout(h_exposure)
+            v_hdr.addLayout(h_exposure)
+            lay_video.addWidget(hdr_box)
+            hdr_box.setVisible(self.card_profile.supports_hdr)
             lay_video.addSpacing(12)
 
             lay_video.addWidget(_field(
@@ -5178,7 +4736,7 @@ if HAS_QT:
 
             # --- Section B: frame generation --------------------
             card_fg, lay_fg = _section(
-                "EXPERIMENTAL · LSFG-VK FRAME GENERATION")
+                "EXPERIMENTAL · LSFG-VK FRAME GENERATION", "framegen")
 
             self._fg_ready_ok = False
             lay_fg.addWidget(_field(
@@ -5288,11 +4846,11 @@ if HAS_QT:
             lay_fg.addWidget(self.lbl_fg_status)
             self._refresh_idle_fg_status()
 
-            if self.duo_mode:
+            if not self.card_profile.supports_framegen:
                 card_fg.setVisible(False)
 
             # --- Section C: outputs, overlay & app ----------------------
-            card_out, lay_out = _section("OBS OUTPUTS, OVERLAY & APP")
+            card_out, lay_out = _section("OBS OUTPUTS, OVERLAY & APP", "outputs")
 
             lay_out.addWidget(_field("OBS Routing"))
             lay_out.addSpacing(6)
@@ -5318,6 +4876,15 @@ if HAS_QT:
                     "Virtual camera output requires the userspace VFIO engine.")
             lay_out.addWidget(self.chk_v4l2)
             lay_out.addSpacing(4)
+
+            preload_nodes = ", ".join(self.card_profile.preload_nodes)
+            if preload_nodes:
+                lay_out.addWidget(_field(
+                    f"Module-free camera: {preload_nodes}",
+                    f"Launch an app with LD_PRELOAD="
+                    f"{self.card_profile.preload_library} to expose "
+                    "the virtual camera without v4l2loopback."))
+            lay_out.addSpacing(8)
 
             self.chk_audio_tap = QCheckBox("Virtual Audio Track")
             self.chk_audio_tap.setToolTip(
@@ -5422,10 +4989,38 @@ if HAS_QT:
             self.btn_detached.clicked.connect(self.start_detached_window)
             lay_out.addWidget(self.btn_detached)
 
+            # --- Section D: diagnostics ---------------------------------
+            card_diag, lay_diag = _section("DIAGNOSTICS", "diagnostics")
+
+            lay_diag.addWidget(_field(
+                "Engine Log",
+                "The userspace engine writes its startup, HDMI and audio "
+                "telemetry to this file."))
+            lay_diag.addSpacing(4)
+            btn_open_log = QPushButton("Open Engine Log")
+            btn_open_log.setObjectName("btnGhost")
+            btn_open_log.setCursor(Qt.PointingHandCursor)
+            btn_open_log.setFixedHeight(32)
+            btn_open_log.clicked.connect(
+                lambda: QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(self.streamer._vfio_log_path)))
+            lay_diag.addWidget(btn_open_log)
+            lay_diag.addSpacing(8)
+
+            btn_open_config = QPushButton("Open Configuration Folder")
+            btn_open_config.setObjectName("btnGhost")
+            btn_open_config.setCursor(Qt.PointingHandCursor)
+            btn_open_config.setFixedHeight(32)
+            btn_open_config.clicked.connect(
+                lambda: QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(CONFIG_DIR)))
+            lay_diag.addWidget(btn_open_config)
+
             # Pack Advanced sections into widget_advanced
             v_adv.addWidget(card_video)
             v_adv.addWidget(card_fg)
             v_adv.addWidget(card_out)
+            v_adv.addWidget(card_diag)
 
             self.widget_advanced.setVisible(self.is_advanced_mode)
             v_side.addWidget(self.widget_advanced)
@@ -5443,6 +5038,7 @@ if HAS_QT:
             self.card_video = card_video
             self.card_fg = card_fg
             self.card_out = card_out
+            self.card_diag = card_diag
             self.scroll_advanced = scroll_side
 
             # -------------------------------------------------------------
@@ -5471,6 +5067,10 @@ if HAS_QT:
 
             b_layout.addStretch(1)
 
+            lbl_hotkeys = QLabel("F fullscreen · Tab OSD · L scale · M mute")
+            lbl_hotkeys.setObjectName("footerText")
+            b_layout.addWidget(lbl_hotkeys)
+
             root_layout.addWidget(bottom_box)
 
             self._apply_advanced_mode()
@@ -5484,61 +5084,7 @@ if HAS_QT:
 
         @property
         def card_display_name(self) -> str:
-            return MODEL_NAMES.get(
-                self.model,
-                "GC570D · Live Gamer DUO" if getattr(self, "duo_mode", False) else "GC573 · Live Gamer 4K"
-            )
-
-        def _format_signal_subtitle(self, info: Optional[Dict] = None) -> str:
-            if info is None:
-                info = getattr(self, "_live", {}) or {}
-
-            canvas_has_signal = bool(hasattr(self, "video_canvas") and self.video_canvas.has_signal)
-            locked = bool(info.get("locked") or canvas_has_signal)
-
-            if not locked:
-                if info.get("starting"):
-                    return "Starting Userspace Engine • Initializing capture • No Audio"
-                if info.get("cached"):
-                    res = info.get("resolution", "")
-                    fps = info.get("framerate", "")
-                    if res and fps:
-                        res_clean = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1×\2\3", str(res))
-                        return f"Last Signal: {res_clean} • {fps} • Waiting for input • No Audio"
-                port_str = f" on HDMI {getattr(self.streamer, 'duo_input', 0) + 1}" if self.duo_mode else ""
-                return f"No HDMI Signal{port_str} • Waiting for input • No Audio"
-
-            # Locked / active signal
-            if canvas_has_signal and not info.get("locked"):
-                cw = self.video_canvas.current_width
-                ch = self.video_canvas.current_height
-                res_str = f"{cw}×{ch}p"
-                fps_str = "60.00 FPS"
-                hdr_str = "SDR"
-            else:
-                res = str(info.get("resolution", "1920x1080p"))
-                res_str = re.sub(r"(\d+)x(\d+)([pi]?)", r"\1×\2\3", res)
-                fps_str = str(info.get("framerate", "60.00 FPS"))
-                if fps_str and not fps_str.endswith("FPS") and not fps_str.endswith("Hz"):
-                    fps_str = f"{fps_str} FPS"
-                hdr_str = info.get("hdr", "SDR")
-                if not hdr_str:
-                    hdr_str = "SDR"
-
-            # L-PCM / Audio label
-            audio_label = ""
-            if hasattr(self, "streamer") and hasattr(self.streamer, "audio_format_label"):
-                audio_label = self.streamer.audio_format_label()
-            if not audio_label or audio_label == "No Audio":
-                audio_state = self.streamer.audio_state() if hasattr(self, "streamer") else {}
-                if audio_state.get("state") == "on":
-                    audio_label = f"L-PCM ({audio_state.get('detail', 'Stereo')})"
-                elif locked:
-                    audio_label = str(info.get("audio") or "L-PCM 48kHz (Stereo)")
-                else:
-                    audio_label = "No Audio"
-
-            return f"{res_str} • {fps_str} • {hdr_str} • {audio_label}"
+            return getattr(self, "card_profile").display_name
 
         def toggle_advanced_mode(self):
             self.is_advanced_mode = not self.is_advanced_mode
@@ -5556,8 +5102,62 @@ if HAS_QT:
             if running:
                 self._launch_mode = mode or "gaming"
                 self._last_launch_mode = self._launch_mode
+                owner = self.status.engine.owner
+                if owner == "none":
+                    owner = "local"
+                self.status.engine = EngineSnapshot(
+                    owner=owner, state="live", mode=self._launch_mode)
             else:
                 self._launch_mode = None
+                self.status.engine = EngineSnapshot(
+                    owner="none", state="off", mode=None)
+            self._render_status()
+
+            if hasattr(self, "btn_launch") and hasattr(self, "btn_studio"):
+                if self._launch_mode == "studio":
+                    self.btn_launch.setText("Switch to Gaming")
+                    self.btn_launch.setObjectName("btnLaunchSwitch")
+                    self.btn_launch.setEnabled(True)
+                    self.btn_launch.setToolTip(
+                        "Open the interactive preview while background "
+                        "capture to OBS remains uninterrupted.")
+                    self.btn_studio.setText("Stop Studio")
+                    self.btn_studio.setObjectName("btnStudioStop")
+                    self.btn_studio.setEnabled(True)
+                    self.btn_studio.setToolTip(
+                        "Stop the headless streamer and release the card.")
+                elif self._launch_mode in ("gaming", "detached"):
+                    if self._launch_mode == "gaming":
+                        self.btn_launch.setText("Stop Gaming")
+                        self.btn_launch.setObjectName("btnLaunchStop")
+                        self.btn_launch.setToolTip(
+                            "Stop the capture engine and release the card.")
+                    else:
+                        self.btn_launch.setText("Switch to Gaming")
+                        self.btn_launch.setObjectName("btnLaunchSwitch")
+                        self.btn_launch.setToolTip(
+                            "Show the feed inside the Console Hub.")
+                    self.btn_launch.setEnabled(True)
+                    self.btn_studio.setText("Switch to Studio")
+                    self.btn_studio.setObjectName("btnStudioSwitch")
+                    self.btn_studio.setEnabled(self.vfio_mode)
+                    self.btn_studio.setToolTip(
+                        "Close the gaming window and keep capturing headless "
+                        "for OBS.")
+                else:
+                    self.btn_launch.setText("Start Gaming")
+                    self.btn_launch.setObjectName("btnLaunchStart")
+                    self.btn_launch.setEnabled(True)
+                    self.btn_launch.setToolTip(
+                        "Start the interactive preview and capture engine.")
+                    self.btn_studio.setText("Studio")
+                    self.btn_studio.setObjectName("btnStudioStart")
+                    self.btn_studio.setEnabled(self.vfio_mode)
+                    self.btn_studio.setToolTip(
+                        "Run headless and publish native frames to PipeWire, "
+                        "the shared frame store, and optional V4L2 for OBS.")
+                for button in (self.btn_launch, self.btn_studio):
+                    button.setStyle(button.style())
 
             if hasattr(self, "btn_detached"):
                 if self._launch_mode == "detached":
@@ -5657,6 +5257,10 @@ if HAS_QT:
                     self.btn_detached.setEnabled(False)
                 if hasattr(self, "combo_led"):
                     self.combo_led.setEnabled(True)
+                self.status.engine = EngineSnapshot(
+                    owner="remote", state="live",
+                    mode=self.status.engine.mode)
+                self._render_status()
                 self._set_vfio_notice(
                     "Remote Session",
                     "Attached to the userspace streamer that owns the card",
@@ -5675,10 +5279,7 @@ if HAS_QT:
             self._remote_status = status
             self._update_framegen_status(status.get("framegen") or {},
                                          bool(status.get("headless")))
-            signal_info = status.get("signal") or {}
-            video = status.get("video") or {}
             audio = status.get("audio") or {}
-            v4l2 = status.get("v4l2") or {}
 
             # Always sync engine controls (volume, mute, aspect, scale) into the GUI
             self._sync_remote_controls(status, audio)
@@ -5686,15 +5287,22 @@ if HAS_QT:
             if not self._remote or self.streamer.is_running:
                 return
 
-            if signal_info.get("locked"):
-                self.lbl_hero_signal.setText(self.card_display_name)
-                self.lbl_hero_meta.setText(self._format_signal_subtitle(signal_info))
-            elif hasattr(self, "video_canvas") and self.video_canvas.has_signal:
-                self.lbl_hero_signal.setText(self.card_display_name)
-                self.lbl_hero_meta.setText(self._format_signal_subtitle())
-            else:
-                self.lbl_hero_signal.setText(self.card_display_name)
-                self.lbl_hero_meta.setText(self._format_signal_subtitle({"locked": False}))
+            remote_signal = SignalSnapshot.from_status(status)
+            if not remote_signal.locked:
+                remote_signal = merge_signal(self.status.signal, remote_signal)
+            audio_label = str(audio.get("label") or "No Audio")
+            self.status.signal = remote_signal
+            self.status.audio = AudioSnapshot(
+                state=str(audio.get("state") or ""),
+                label=audio_label,
+                layout=str(audio.get("layout") or ""),
+                muted=bool(audio.get("muted")),
+                gain=audio.get("gain"),
+            )
+            self.status.engine = EngineSnapshot(
+                owner="remote", state="live",
+                mode="studio" if status.get("headless") else "gaming")
+            self._render_status()
 
         def _sync_remote_controls(self, status: Dict, audio: Dict):
             """Mirror the engine's settings into the local controls.
@@ -5867,6 +5475,7 @@ if HAS_QT:
         def toggle_fullscreen(self):
             if not hasattr(self, "_fullscreen_window") or self._fullscreen_window is None:
                 self._fullscreen_window = FullscreenVideoWindow(self.video_canvas, self)
+                self._fullscreen_window.set_status(self.status)
             if self._fullscreen_window.isVisible():
                 self._fullscreen_window.close()
             else:
@@ -6001,9 +5610,9 @@ if HAS_QT:
                 QTimer.singleShot(900, self._restore_led_after_stream)
 
         def _set_vfio_notice(self, title: str, detail: str, seconds: float = 8.0):
-            self.lbl_hero_signal.setText(self.card_display_name)
-            self.lbl_hero_meta.setText(f"{title} • {detail}")
+            self.status.notice = f"{title} • {detail}"
             self._vfio_notice_until = time.time() + seconds
+            self._render_status()
 
         def start_gaming_screen(self, detached: bool = False):
             if self.streamer.is_running:
@@ -6420,6 +6029,11 @@ if HAS_QT:
                     self.canvas.show_toast(message, duration)
                 except Exception:
                     pass
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.show_toast(message, duration)
+                except Exception:
+                    pass
             if self._ipc is not None and self._ipc.connected:
                 try:
                     self._ipc.show_toast(message)
@@ -6462,9 +6076,39 @@ if HAS_QT:
             self._update_framegen_button(mode)
             self._apply_framegen()
 
+        def toggle_framegen_quick(self):
+            if not hasattr(self, "combo_framegen"):
+                return
+            if not getattr(self, "_fg_ready_ok", False):
+                self.show_toast(
+                    "Frame generation needs lsfg-vk — see Advanced → "
+                    "Frame Generation")
+                return
+            order = ("off", "60to120", "30to60")
+            current = self.combo_framegen.currentData() or "off"
+            if current not in order:
+                current = "off"
+            target = order[(order.index(current) + 1) % len(order)]
+            idx = self.combo_framegen.findData(target)
+            if idx >= 0:
+                self.combo_framegen.setCurrentIndex(idx)
+            self._update_framegen_button(target)
+            label = {
+                "off": "Off",
+                "60to120": "60 → 120 FPS",
+                "30to60": "30 → 60 FPS",
+            }.get(target, target)
+            self.show_toast(f"Frame Generation: {label}")
+
         def _update_framegen_button(self, mode: Optional[str] = None):
             if not mode:
                 mode = self.saved_cfg.get("framegen_mode", "off")
+            self.status.framegen = FramegenSnapshot(
+                mode=mode,
+                ready=self.status.framegen.ready,
+                active=self.status.framegen.active,
+                output_fps=self.status.framegen.output_fps,
+            )
 
             if hasattr(self, "btn_framegen"):
                 if mode == "60to120":
@@ -6484,6 +6128,12 @@ if HAS_QT:
                     self.btn_framegen.setStyleSheet("")
                     self.btn_framegen.setToolTip("Frame generation is Off (native zero-latency path). Click to enable 60→120 FPS.")
 
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.set_status(self.status)
+                except Exception:
+                    pass
+
         def on_fg_perf_toggled(self, _enabled: bool):
             self._apply_framegen()
 
@@ -6500,6 +6150,12 @@ if HAS_QT:
                               legacy_dll_found: Optional[bool] = None):
             """Colour the readiness line green/amber with the exact fix."""
             self._fg_ready_ok = bool(layer_found and dll_found)
+            self.status.framegen = FramegenSnapshot(
+                mode=self.status.framegen.mode,
+                ready=self._fg_ready_ok,
+                active=self.status.framegen.active,
+                output_fps=self.status.framegen.output_fps,
+            )
             if not hasattr(self, "lbl_fg_ready"):
                 return
             if layer_found and dll_found:
@@ -6584,6 +6240,17 @@ if HAS_QT:
             present = float(fg.get("present_fps") or 0.0)
             output = float(fg.get("output_fps") or 0.0)
             unique = float(fg.get("unique_fps") or 0.0)
+            self.status.framegen = FramegenSnapshot(
+                mode=mode,
+                ready=bool(fg.get("layer_found") and fg.get("dll_found")),
+                active=bool(fg.get("vulkan_active")) and mode != "off",
+                output_fps=output or None,
+            )
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.set_status(self.status)
+                except Exception:
+                    pass
 
             if mode == "off":
                 self.lbl_fg_status.setText(
@@ -6806,22 +6473,83 @@ if HAS_QT:
             else:
                 QTimer.singleShot(250, lambda: self._wait_and_restart_after_resync(attempts - 1))
 
-        def _show_live(self, info):
-            self.lbl_hero_signal.setText(self.card_display_name)
-            self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
+        def _audio_label_for(self, info: Optional[Dict] = None) -> str:
+            if hasattr(self, "streamer"):
+                label = self.streamer.audio_format_label()
+                if label and label != "No Audio":
+                    return label
+                state = self.streamer.audio_state()
+                if state.get("state") == "on":
+                    detail = state.get("detail") or "Stereo"
+                    return f"L-PCM ({detail})"
+            if info:
+                return str(info.get("audio") or "No Audio")
+            return "No Audio"
 
-            if self.vfio_mode:
-                self.lbl_pill.setText(ENGINE_VFIO_TEXT)
+        def _apply_info(self, info: Optional[Dict],
+                        engine_state: Optional[str] = None,
+                        owner: Optional[str] = None):
+            info = info or {}
+            self._live = info
+            signal = SignalSnapshot.from_info(info)
+            audio = AudioSnapshot(label=self._audio_label_for(info))
+            if engine_state is None:
+                if info.get("starting") and self.streamer.is_running:
+                    engine_state = "starting"
+                elif self.streamer.is_running:
+                    engine_state = "live"
+                else:
+                    engine_state = "off"
+            if owner is None:
+                owner = self.status.engine.owner
+                if owner == "none":
+                    owner = "local"
+            self.status.signal = signal
+            self.status.audio = audio
+            self.status.engine = EngineSnapshot(
+                owner=owner,
+                state=engine_state,
+                mode=self._launch_mode or self.status.engine.mode,
+                pid=self.status.engine.pid,
+            )
+            self._render_status()
+
+        def _render_status(self):
+            snap = self.status
+            self.lbl_hero_signal.setText(snap.card_name)
+            if time.time() < self._vfio_notice_until and snap.notice:
+                self.lbl_hero_meta.setText(snap.notice)
+            else:
+                snap.notice = None
+                self.lbl_hero_meta.setText(snap.hero_subtitle())
+
+            self.lbl_pill.setText(snap.engine.label())
+            tone = snap.engine.tone()
+            if tone == "live":
                 self.lbl_pill.setStyleSheet(
-                    "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-                return
+                    "background-color: #0d2318; color: #34d399; "
+                    "border: 1px solid #164e32;")
+            elif tone == "starting":
+                self.lbl_pill.setStyleSheet(
+                    "background-color: #1a2030; color: #93c5fd; "
+                    "border: 1px solid #2b4f6e;")
+            elif tone == "error":
+                self.lbl_pill.setStyleSheet(
+                    "background-color: #2a1518; color: #f87171; "
+                    "border: 1px solid #5b2028;")
+            else:
+                self.lbl_pill.setStyleSheet(
+                    "background-color: #1a2030; color: #9aa3b5; "
+                    "border: 1px solid #2a3242;")
 
-            res = info.get("resolution", "No Signal")
-            fps = info.get("framerate", "")
-            hdr_str = f" • {info['hdr']}" if info.get("hdr") else ""
-            chroma_str = f" • {info['chroma']}" if info.get("chroma") else ""
-            self.lbl_pill.setText(f"● {res} @ {fps}{chroma_str}{hdr_str}")
-            self.lbl_pill.setStyleSheet("background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.set_status(snap)
+                except Exception:
+                    pass
+
+        def _show_live(self, info):
+            self._apply_info(info, engine_state="live")
 
         def _set_vfio_standby(self, info):
             if hasattr(self, "video_canvas") and self.video_canvas.has_signal:
@@ -6835,11 +6563,9 @@ if HAS_QT:
                     "hdr": "SDR",
                 })
                 return
-            self.lbl_pill.setText(ENGINE_VFIO_TEXT)
-            self.lbl_pill.setStyleSheet(
-                "background-color: #0d2318; color: #34d399; border: 1px solid #164e32;")
-            self.lbl_hero_signal.setText(self.card_display_name)
-            self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
+            self._apply_info(
+                info,
+                engine_state="live" if self.streamer.is_running else "off")
 
         def _update_status_vfio(self):
             if self._remote and not self.streamer.is_running:
@@ -6893,13 +6619,8 @@ if HAS_QT:
                         set_audio_mute(self.muted)
                         self._vfio_volume_applies += 1
                     self._show_live(canvas_info)
-                elif info.get("starting"):
-                    self.lbl_hero_signal.setText(self.card_display_name)
-                    self.lbl_hero_meta.setText(
-                        "Starting Userspace Engine • Initializing capture • No Audio")
                 else:
-                    self.lbl_hero_signal.setText(self.card_display_name)
-                    self.lbl_hero_meta.setText(self._format_signal_subtitle(info))
+                    self._apply_info(info)
                 return
 
             if canvas_locked:
@@ -6972,10 +6693,7 @@ if HAS_QT:
                     "hdr": "SDR",
                 })
             else:
-                self.lbl_pill.setText("○ Standby")
-                self.lbl_pill.setStyleSheet("background-color: #1a202c; color: #94a3b8; border: 1px solid #2d3748;")
-                self.lbl_hero_signal.setText(self.card_display_name)
-                self.lbl_hero_meta.setText(self._format_signal_subtitle())
+                self._apply_info(info, engine_state="off", owner="none")
 
         def _init_tray(self):
             if not QSystemTrayIcon.isSystemTrayAvailable():

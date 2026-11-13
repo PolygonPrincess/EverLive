@@ -69,6 +69,9 @@ jobs:
           python3 -m py_compile tools/everlive/everlive_viewer.py
           python3 -m py_compile tools/everlive/everlive_client.py
           python3 -m py_compile tools/everlive/framestore.py
+          python3 -m py_compile tools/everlive/card_profile.py
+          python3 -m py_compile tools/everlive/status_model.py
+          python3 -m py_compile tools/everlive/theme.py
 
       - name: Verify shell script syntax
         run: |
