@@ -169,13 +169,15 @@ def find_preload_library(profile, extra_dirs: Sequence[str] = ()) -> Optional[st
     if not library:
         return None
     here = Path(__file__).resolve().parent
+    # Prefer a build-tree library when running from source; installed trees
+    # only have the library in the system library directory.
     candidates = [
+        here.parent / "opengc573-userd" / library,
+        here.parent / "opengc570d-userd" / library,
         Path("/usr/local/lib") / library,
         Path("/usr/lib") / library,
         Path("/usr/lib64") / library,
         Path.home() / ".local/lib" / library,
-        here.parent / "opengc573-userd" / library,
-        here.parent / "opengc570d-userd" / library,
     ]
     candidates.extend(Path(directory) / library for directory in extra_dirs)
     for path in candidates:
