@@ -34,9 +34,12 @@ try:
         CAP_RGB_LED,
     )
     from framestore import FrameStore, FrameStoreError, open_store
+    from recorder import (
+        DEFAULT_OUTPUT_DIR, QUALITY_CRF, StreamRecorder,
+    )
     from status_model import (
-        AudioSnapshot, EngineSnapshot, FramegenSnapshot, SignalSnapshot,
-        StatusSnapshot, merge_signal,
+        AudioSnapshot, EngineSnapshot, FramegenSnapshot, RecordingSnapshot,
+        SignalSnapshot, StatusSnapshot, merge_signal,
     )
     from theme import (
         ACCENT, BORDER, COMBO_POPUP_QSS, DANGER, MAIN_QSS, OSD_QSS,
@@ -51,9 +54,12 @@ except ImportError:  # imported as a module from another working directory
         CAP_RGB_LED,
     )
     from framestore import FrameStore, FrameStoreError, open_store
+    from recorder import (
+        DEFAULT_OUTPUT_DIR, QUALITY_CRF, StreamRecorder,
+    )
     from status_model import (
-        AudioSnapshot, EngineSnapshot, FramegenSnapshot, SignalSnapshot,
-        StatusSnapshot, merge_signal,
+        AudioSnapshot, EngineSnapshot, FramegenSnapshot, RecordingSnapshot,
+        SignalSnapshot, StatusSnapshot, merge_signal,
     )
     from theme import (
         ACCENT, BORDER, COMBO_POPUP_QSS, DANGER, MAIN_QSS, OSD_QSS,
@@ -145,6 +151,8 @@ DEFAULT_SETTINGS = {
     "fg_flow_scale": 1.0,
     "fg_perf_mode": False,
     "fg_low_latency": True,
+    "record_dir": DEFAULT_OUTPUT_DIR,
+    "record_quality": "balanced",
     "minimize_to_tray": True,
     "duo_input": 0,
     "duo_edid_bridge": True,
@@ -206,6 +214,10 @@ def load_settings() -> dict:
         settings["fg_perf_mode"] = False
     if not isinstance(settings.get("fg_low_latency"), bool):
         settings["fg_low_latency"] = True
+    if not isinstance(settings.get("record_dir"), str) or not settings["record_dir"]:
+        settings["record_dir"] = DEFAULT_OUTPUT_DIR
+    if settings.get("record_quality") not in QUALITY_CRF:
+        settings["record_quality"] = "balanced"
     # The OpenGL shader pipeline (HUD protection, CAS) no longer exists.
     for stale in ("framegen_hud_protect", "cas_enabled", "cas_strength"):
         settings.pop(stale, None)
@@ -3631,6 +3643,13 @@ if HAS_QT:
             self.btn_mute.clicked.connect(self._toggle_mute)
             h_hud_top.addWidget(self.btn_mute)
 
+            self.btn_record = QPushButton("Record (R)")
+            self.btn_record.setObjectName("osdAction")
+            self.btn_record.setFocusPolicy(Qt.NoFocus)
+            self.btn_record.setCursor(Qt.PointingHandCursor)
+            self.btn_record.clicked.connect(self.main_window.toggle_recording)
+            h_hud_top.addWidget(self.btn_record)
+
             self.btn_framegen = None
             if getattr(self.main_window.card_profile, "supports_framegen", False):
                 self.btn_framegen = QPushButton("Frame Gen: Off (G)")
@@ -3662,8 +3681,8 @@ if HAS_QT:
             v_hud.addWidget(self.lbl_hud_meta)
 
             self.lbl_hotkeys = QLabel(
-                "Tab OSD · F exit · A aspect · L scale · M mute · G framegen",
-                self)
+                "Tab OSD · F exit · A aspect · L scale · M mute · "
+                "R record · G framegen", self)
             self.lbl_hotkeys.setStyleSheet(
                 "color: rgba(203, 213, 225, 190); background: transparent; "
                 "font-size: 10px;")
@@ -3720,6 +3739,17 @@ if HAS_QT:
                 f"Scale: {'INTEGER' if scale == 'integer' else 'FIT'} (L)")
             muted = bool(getattr(self.main_window, "muted", False))
             self.btn_mute.setText("Unmute (M)" if muted else "Mute (M)")
+            recording = (self._status.recording
+                         if self._status is not None else None)
+            if recording is not None and recording.active:
+                stamp = self.main_window._format_duration(recording.elapsed)
+                self.btn_record.setText(f"Stop Rec {stamp} (R)")
+                self.btn_record.setStyleSheet(
+                    "background: #7f1d1d; border-color: #b91c1c; "
+                    "color: #ffffff;")
+            else:
+                self.btn_record.setText("Record (R)")
+                self.btn_record.setStyleSheet("")
             if self.btn_framegen is not None:
                 mode = "off"
                 if self._status is not None:
@@ -3847,6 +3877,10 @@ if HAS_QT:
             elif key == Qt.Key_M:
                 self._toggle_mute()
                 event.accept()
+            elif key == Qt.Key_R:
+                self.main_window.toggle_recording()
+                self._update_hud_controls()
+                event.accept()
             elif key == Qt.Key_G and self.btn_framegen is not None:
                 self.main_window.toggle_framegen_quick()
                 self._update_hud_controls()
@@ -3934,6 +3968,8 @@ if HAS_QT:
                 streamer, "card_profile", detect_card_profile(self.model))
             self.ui_duo = self.card_profile.supports_dual_input
             self.status = StatusSnapshot(card=self.card_profile)
+            self.recorder = StreamRecorder()
+            self._record_error_shown = ""
             self.enable_vsync = vsync
             self.muted = False
             self.saved_cfg = load_settings()
@@ -3978,6 +4014,11 @@ if HAS_QT:
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.update_status)
             self.timer.start(1000)
+
+            # Recording state is polled once per second from the worker.
+            self._record_timer = QTimer(self)
+            self._record_timer.timeout.connect(self._refresh_recording)
+            self._record_timer.start(1000)
 
             # Remote channel to a streamer that already owns the device.
             # QSocketNotifier keeps this on the GUI thread: no worker threads
@@ -4452,6 +4493,30 @@ if HAS_QT:
                 v_side.addSpacing(16)
                 self._update_framegen_button(
                     self.saved_cfg.get("framegen_mode", "off"))
+
+            lbl_rec_hdr = QLabel("RECORDING")
+            lbl_rec_hdr.setObjectName("sectionTitle")
+            lbl_rec_hdr.setStyleSheet(
+                "font-size: 10px; color: #64748b; font-weight: 700; "
+                "letter-spacing: 0.5px;")
+            v_side.addWidget(lbl_rec_hdr)
+            v_side.addSpacing(6)
+
+            self.btn_record = QPushButton("● Start Recording")
+            self.btn_record.setObjectName("btnGhost")
+            self.btn_record.setFixedHeight(32)
+            self.btn_record.setCursor(Qt.PointingHandCursor)
+            self.btn_record.setToolTip(
+                "Record the live capture feed to an MP4 file. Manual start "
+                "and stop only.")
+            self.btn_record.clicked.connect(self.toggle_recording)
+            v_side.addWidget(self.btn_record)
+
+            self.lbl_record_time = QLabel("Ready")
+            self.lbl_record_time.setObjectName("fieldLabel")
+            self.lbl_record_time.setWordWrap(True)
+            v_side.addWidget(self.lbl_record_time)
+            v_side.addSpacing(16)
 
             lbl_eng_hdr = QLabel("CAPTURE ENGINE")
             lbl_eng_hdr.setObjectName("sectionTitle")
@@ -4989,7 +5054,59 @@ if HAS_QT:
             self.btn_detached.clicked.connect(self.start_detached_window)
             lay_out.addWidget(self.btn_detached)
 
-            # --- Section D: diagnostics ---------------------------------
+            # --- Section D: recording -----------------------------------
+            card_rec, lay_rec = _section("RECORDING", "recording")
+
+            lay_rec.addWidget(_field(
+                "Output Folder",
+                "Recordings are written as timestamped MP4 files."))
+            lay_rec.addSpacing(4)
+            h_rec_dir = QHBoxLayout()
+            h_rec_dir.setSpacing(6)
+            self.edit_record_dir = QLineEdit(
+                str(self.saved_cfg.get("record_dir", DEFAULT_OUTPUT_DIR)))
+            self.edit_record_dir.setFixedHeight(32)
+            self.edit_record_dir.setReadOnly(True)
+            self.edit_record_dir.setCursorPosition(0)
+            self.edit_record_dir.setToolTip(self.edit_record_dir.text())
+            h_rec_dir.addWidget(self.edit_record_dir, 1)
+            btn_browse_rec = QPushButton("Browse…")
+            btn_browse_rec.setObjectName("btnGhost")
+            btn_browse_rec.setFixedHeight(32)
+            btn_browse_rec.clicked.connect(self.browse_record_dir)
+            h_rec_dir.addWidget(btn_browse_rec)
+            lay_rec.addLayout(h_rec_dir)
+            lay_rec.addSpacing(10)
+
+            lay_rec.addWidget(_field(
+                "Quality",
+                "Higher quality uses a larger file. Recording is video-only "
+                "in this build; an audio track is a follow-up."))
+            lay_rec.addSpacing(4)
+            self.combo_record_quality = QComboBox()
+            self._style_combobox(self.combo_record_quality)
+            for label, key in (
+                    ("High (CRF 18)", "high"),
+                    ("Balanced (CRF 23)", "balanced"),
+                    ("Small file (CRF 28)", "small")):
+                self.combo_record_quality.addItem(label, key)
+            idx = self.combo_record_quality.findData(
+                self.saved_cfg.get("record_quality", "balanced"))
+            if idx >= 0:
+                self.combo_record_quality.setCurrentIndex(idx)
+            self.combo_record_quality.currentIndexChanged.connect(
+                self.on_record_quality_changed)
+            lay_rec.addWidget(self.combo_record_quality)
+            lay_rec.addSpacing(6)
+
+            rec_note = QLabel(
+                "Recording runs only while the Console Hub is open. "
+                "Start/stop is always manual.")
+            rec_note.setObjectName("fieldLabel")
+            rec_note.setWordWrap(True)
+            lay_rec.addWidget(rec_note)
+
+            # --- Section E: diagnostics ---------------------------------
             card_diag, lay_diag = _section("DIAGNOSTICS", "diagnostics")
 
             lay_diag.addWidget(_field(
@@ -5020,6 +5137,7 @@ if HAS_QT:
             v_adv.addWidget(card_video)
             v_adv.addWidget(card_fg)
             v_adv.addWidget(card_out)
+            v_adv.addWidget(card_rec)
             v_adv.addWidget(card_diag)
 
             self.widget_advanced.setVisible(self.is_advanced_mode)
@@ -5038,6 +5156,7 @@ if HAS_QT:
             self.card_video = card_video
             self.card_fg = card_fg
             self.card_out = card_out
+            self.card_rec = card_rec
             self.card_diag = card_diag
             self.scroll_advanced = scroll_side
 
@@ -5067,7 +5186,8 @@ if HAS_QT:
 
             b_layout.addStretch(1)
 
-            lbl_hotkeys = QLabel("F fullscreen · Tab OSD · L scale · M mute")
+            lbl_hotkeys = QLabel(
+                "F fullscreen · Tab OSD · L scale · M mute · R record")
             lbl_hotkeys.setObjectName("footerText")
             b_layout.addWidget(lbl_hotkeys)
 
@@ -5543,6 +5663,8 @@ if HAS_QT:
 
             self._switch_pending = target
             self._handoff_tries = 0
+            if self.recorder.active:
+                self._stop_recording()
             if self._ipc is not None:
                 self._ipc.close()
             self.streamer.stop()
@@ -5597,6 +5719,8 @@ if HAS_QT:
         def _stop_stream(self):
             self._switch_pending = None
             self._handoff_tries = 0
+            if self.recorder.active:
+                self._stop_recording()
             if hasattr(self, "_fullscreen_window") and self._fullscreen_window and self._fullscreen_window.isVisible():
                 self._fullscreen_window.close()
             if self._ipc is not None:
@@ -5834,6 +5958,9 @@ if HAS_QT:
             if not self.duo_mode:
                 return
             port = 1 if self.combo_duo_input.itemData(index) == 1 else 0
+            if self.recorder.active:
+                self._stop_recording()
+                self.show_toast("Recording stopped for the HDMI input change.")
             self.streamer.set_duo_input(port)
             if hasattr(self, "video_canvas"):
                 self.video_canvas.set_port(port)
@@ -6021,6 +6148,137 @@ if HAS_QT:
                     elif self.vfio_mode:
                         set_vfio_led(4)
                     self.show_toast(f"LED Color: {hex_color.upper()}")
+
+        def _format_duration(self, seconds: float) -> str:
+            total = max(0, int(seconds))
+            hours, rem = divmod(total, 3600)
+            minutes, secs = divmod(rem, 60)
+            if hours:
+                return f"{hours}:{minutes:02d}:{secs:02d}"
+            return f"{minutes:02d}:{secs:02d}"
+
+        def browse_record_dir(self):
+            path = QFileDialog.getExistingDirectory(
+                self, "Select Recording Folder",
+                self.edit_record_dir.text() or DEFAULT_OUTPUT_DIR)
+            if not path:
+                return
+            self.saved_cfg["record_dir"] = path
+            save_settings({"record_dir": path})
+            self.edit_record_dir.setText(path)
+            self.edit_record_dir.setCursorPosition(0)
+            self.edit_record_dir.setToolTip(path)
+            self.show_toast(f"Recordings → {path}")
+
+        def on_record_quality_changed(self, _index: int = 0):
+            quality = self.combo_record_quality.currentData() or "balanced"
+            self.saved_cfg["record_quality"] = quality
+            save_settings({"record_quality": quality})
+
+        def _recording_source(self):
+            if self.streamer.duo_mode:
+                port = getattr(self.video_canvas, "port", 0)
+                return SHM_NAME, port
+            target = (SHM_GC573_NAME
+                      if os.path.exists(SHM_GC573_NAME) else SHM_NAME)
+            return target, 0
+
+        def toggle_recording(self):
+            if self.recorder.active:
+                self._stop_recording()
+            else:
+                self._start_recording()
+
+        def _start_recording(self):
+            if self.recorder.active:
+                return
+            if not self.video_canvas.has_signal:
+                self.show_toast("No active HDMI signal to record.")
+                return
+            width = int(getattr(self.video_canvas, "current_width", 0) or 0)
+            height = int(getattr(self.video_canvas, "current_height", 0) or 0)
+            if width <= 0 or height <= 0:
+                self.show_toast("No active video frame to record.")
+                return
+            fps = self.status.signal.fps
+            if not fps or fps <= 0:
+                fps = 60.0
+            shm_path, port = self._recording_source()
+            output_dir = self.saved_cfg.get("record_dir", DEFAULT_OUTPUT_DIR)
+            quality = self.saved_cfg.get("record_quality", "balanced")
+            ok, message = self.recorder.start(
+                shm_path, port, width, height, fps,
+                output_dir=output_dir, quality=quality)
+            if ok:
+                self._record_error_shown = ""
+                self._refresh_recording()
+                self.show_toast(f"Recording started: {message}")
+            else:
+                self.show_toast(message)
+
+        def _stop_recording(self):
+            ok, message = self.recorder.stop()
+            self._refresh_recording()
+            if ok:
+                self.show_toast(f"Recording saved: {message}")
+            else:
+                self.show_toast(message)
+
+        def _refresh_recording(self):
+            info = self.recorder.snapshot()
+            self.status.recording = RecordingSnapshot(
+                active=info.active,
+                elapsed=info.elapsed,
+                path=info.path,
+                frames=info.frames,
+                dropped=info.dropped,
+                error=info.error,
+            )
+            if info.active:
+                elapsed = self._format_duration(info.elapsed)
+                self.btn_record.setText(f"■ Stop Recording  {elapsed}")
+                self.btn_record.setStyleSheet(
+                    "background-color: #7f1d1d; color: #ffffff; "
+                    "border: 1px solid #b91c1c; font-weight: 600;")
+                dropped = (f" · {info.dropped} dropped"
+                           if info.dropped else "")
+                self.lbl_record_time.setText(
+                    f"{elapsed} · {info.frames} frames{dropped}")
+            else:
+                self.btn_record.setText("● Start Recording")
+                self.btn_record.setStyleSheet("")
+                if info.error:
+                    self.lbl_record_time.setText(info.error)
+                    if info.error != self._record_error_shown:
+                        self._record_error_shown = info.error
+                        self.show_toast(info.error)
+                elif self.lbl_record_time.text() not in (
+                        "", "Ready"):
+                    if not self.lbl_record_time.text().startswith("Recording"):
+                        self.lbl_record_time.setText("Ready")
+            if getattr(self, "_fullscreen_window", None) is not None:
+                try:
+                    self._fullscreen_window.set_status(self.status)
+                except Exception:
+                    pass
+
+        def _confirm_recording_exit(self) -> bool:
+            if not self.recorder.active:
+                return True
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Recording in Progress")
+            box.setText(
+                "A recording is still running. Stop and save it before "
+                "closing the Console Hub?")
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+            box.setDefaultButton(QMessageBox.Yes)
+            box.button(QMessageBox.Yes).setText("Stop and Save")
+            box.button(QMessageBox.Cancel).setText("Cancel")
+            if box.exec() != QMessageBox.Yes:
+                return False
+            self._stop_recording()
+            return True
 
         def show_toast(self, message: str, duration: float = 3.0):
             """Trigger an OSD toast notification on both GUI embedded canvas and gaming window."""
@@ -6296,6 +6554,8 @@ if HAS_QT:
             preset = self.combo_presets.currentText()
             save_settings({"preset": preset})
             if self.streamer.is_running:
+                if self.recorder.active:
+                    self._stop_recording()
                 self.streamer.stop()
                 QTimer.singleShot(150, self.start_gaming_screen)
 
@@ -6431,6 +6691,8 @@ if HAS_QT:
             if self.vfio_mode:
                 was_running = self.streamer.is_running
                 if was_running:
+                    if self.recorder.active:
+                        self._stop_recording()
                     self.streamer.stop()
                     self._set_launch_running(False)
                 restart = (self.start_studio
@@ -6449,6 +6711,8 @@ if HAS_QT:
             try:
                 was_running = self.streamer.is_running
                 if was_running:
+                    if self.recorder.active:
+                        self._stop_recording()
                     self.streamer.stop()
                     self._set_launch_running(False)
                 self.streamer.resync()
@@ -6578,6 +6842,8 @@ if HAS_QT:
 
             if self.streamer.is_running:
                 if not self.streamer.poll():
+                    if self.recorder.active:
+                        self._stop_recording()
                     self._set_launch_running(False)
                     QTimer.singleShot(900, self._restore_led_after_stream)
                     if not self.streamer._vfio_saw_output:
@@ -6652,6 +6918,8 @@ if HAS_QT:
             if self.streamer.is_running:
                 if not self.streamer.poll():
                     # Window was closed by user
+                    if self.recorder.active:
+                        self._stop_recording()
                     self._set_launch_running(False)
                     return
                 live = getattr(self, "_live", None)
@@ -6780,6 +7048,8 @@ if HAS_QT:
                     self._restore_from_tray()
 
         def _force_quit(self):
+            if not self._confirm_recording_exit():
+                return
             try:
                 geo_hex = self.saveGeometry().toHex().data().decode("ascii")
                 save_settings({
@@ -6830,6 +7100,10 @@ if HAS_QT:
                         "The Console Hub is minimized to the system tray. Click the tray icon to reopen.",
                         QSystemTrayIcon.Information,
                         3000)
+                return
+
+            if not self._confirm_recording_exit():
+                event.ignore()
                 return
 
             self._ipc_shutdown = True

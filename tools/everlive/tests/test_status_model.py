@@ -14,6 +14,7 @@ from card_profile import GC570D_PROFILE, GC573_PROFILE  # noqa: E402
 from status_model import (  # noqa: E402
     AudioSnapshot,
     EngineSnapshot,
+    RecordingSnapshot,
     SignalSnapshot,
     StatusSnapshot,
     merge_signal,
@@ -101,6 +102,14 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(
             snap.hero_subtitle(),
             "Starting Userspace Engine • Initializing capture • No Audio")
+
+    def test_recording_snapshot_defaults(self) -> None:
+        snap = StatusSnapshot(card=GC573_PROFILE)
+        self.assertFalse(snap.recording.active)
+        snap.recording = RecordingSnapshot(
+            active=True, elapsed=12.5, frames=750, path="/tmp/out.mp4")
+        self.assertTrue(snap.recording.active)
+        self.assertEqual(snap.recording.frames, 750)
 
     def test_engine_labels(self) -> None:
         self.assertEqual(EngineSnapshot().label(), "○ Standby")

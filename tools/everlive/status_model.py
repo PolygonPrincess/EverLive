@@ -185,6 +185,16 @@ class ServiceSnapshot:
     active: bool = False
 
 
+@dataclass(frozen=True)
+class RecordingSnapshot:
+    active: bool = False
+    elapsed: float = 0.0
+    path: str = ""
+    frames: int = 0
+    dropped: int = 0
+    error: str = ""
+
+
 @dataclass
 class StatusSnapshot:
     card: Any = None
@@ -194,6 +204,7 @@ class StatusSnapshot:
     outputs: OutputSnapshot = field(default_factory=OutputSnapshot)
     framegen: FramegenSnapshot = field(default_factory=FramegenSnapshot)
     service: ServiceSnapshot = field(default_factory=ServiceSnapshot)
+    recording: RecordingSnapshot = field(default_factory=RecordingSnapshot)
     notice: Optional[str] = None
 
     @property

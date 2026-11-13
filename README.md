@@ -165,6 +165,14 @@ EverLive streams raw YUYV capture frames directly to a virtual video device node
 > **Simultaneous 1440p120 Gaming & 4K OBS Recording:**  
 > If you game at 1440p @ 120 FPS, set your OBS canvas/output to 4K (3840×2160) and right-click the EverLive V4L2 source $\to$ *Transform $\to$ Fit to Screen*. OBS will hardware-upscale the native 1440p120 feed to 4K in real time for crisp YouTube uploads with the high-bitrate VP9/AV1 codec!
 
+> [!TIP]
+> **Built-in MP4 recording:** The Console Hub also has a manual
+> **Start Recording / Stop Recording** control. It writes the live capture
+> feed to a timestamped MP4 under `~/Videos/EverLive` by default. Recording is
+> always user-started, never automatic, and stops when the Hub closes. The
+> first iteration is video-only; the OBS virtual-camera path remains the way to
+> record with game audio.
+
 ### Option 2: Studio / Headless Mode (Zero Display Overhead)
 If you play directly on a TV or secondary monitor connected to the GC573's **HDMI OUT (Hardware Passthrough)**, you do not need an open game window on your PC desktop:
 * Click **`Start Studio / Headless (OBS)`** in the Hub (or run `./play.sh --loopback --headless`).

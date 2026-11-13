@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Manual Console Hub recording:** Start/Stop Recording in Quick Controls and the fullscreen OSD writes a timestamped MP4 under `~/Videos/EverLive`. Recording is user-started only, runs in a background writer thread, reports elapsed time/frame/drop counts, and prompts to save before the Hub exits. The first iteration is video-only; an audio track and engine-side recording remain follow-ups.
 - **Lock-free shared frame store and reusable V4L2 preload engine:**
   - `libeverlive-core` now provides a triple-buffered POSIX shared-memory frame store (`everlive_framestore`) and a card-descriptor-driven V4L2 virtual-camera engine (`libeverlive-core/v4l2`).
   - GC570D keeps `/dev/video60` and `/dev/video61` through `libgc570d-v4l2.so`, now built from the shared engine.
