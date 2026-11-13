@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+from i18n import tr, trf
+
 
 def _as_int(value: Any, default: int = 0) -> int:
     try:
@@ -134,15 +136,15 @@ class EngineSnapshot:
     def label(self) -> str:
         if self.state == "live":
             if self.owner == "service":
-                return "● Background Service"
+                return tr("● Background Service")
             if self.owner == "remote":
-                return "● Remote Session"
-            return "● Userspace VFIO"
+                return tr("● Remote Session")
+            return tr("● Userspace VFIO")
         if self.state == "starting":
-            return "● Starting…"
+            return tr("● Starting…")
         if self.state == "error":
-            return "⚠ Engine Error"
-        return "○ Standby"
+            return tr("⚠ Engine Error")
+        return tr("○ Standby")
 
     def tone(self) -> str:
         if self.state == "live":
@@ -198,21 +200,25 @@ class StatusSnapshot:
 
     @property
     def card_name(self) -> str:
-        return getattr(self.card, "display_name", "EverLive Console Hub")
+        return getattr(self.card, "display_name", tr("EverLive Console Hub"))
 
     def hero_subtitle(self) -> str:
         if self.signal.starting:
-            return "Starting Userspace Engine • Initializing capture • No Audio"
+            return tr("Starting Userspace Engine • Initializing capture • No Audio")
         if not self.signal.locked:
             if self.signal.cached:
                 res = self.signal.resolution_label()
                 fps = self.signal.fps_label()
                 if res and fps:
-                    return f"Last Signal: {res} • {fps} • Waiting for input • No Audio"
+                    return trf(
+                        "Last Signal: {res} • {fps} • Waiting for input • No Audio",
+                        res=res, fps=fps)
             port = ""
             if self.signal.port is not None:
                 port = f" on HDMI {self.signal.port + 1}"
-            return f"No HDMI Signal{port} • Waiting for input • No Audio"
+            return trf(
+                "No HDMI Signal{port} • Waiting for input • No Audio",
+                port=port)
 
         parts = []
         res = self.signal.resolution_label()
@@ -221,8 +227,8 @@ class StatusSnapshot:
         fps = self.signal.fps_label()
         if fps:
             parts.append(fps)
-        parts.append(self.signal.hdr or "SDR")
-        parts.append(self.audio.label or "No Audio")
+        parts.append(self.signal.hdr or tr("SDR"))
+        parts.append(self.audio.label or tr("No Audio"))
         return " • ".join(parts)
 
 

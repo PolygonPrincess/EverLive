@@ -35,6 +35,10 @@ GC573_BINS  := gc573_user_streamer everlive_userd gc573_user_probe
 GC570D_BINS := opengc570d-userd gc570d-ctl
 ICON_SIZES  := 16 32 48 64 128 256 512
 
+# Python modules imported by everlive_viewer.py.
+VIEWER_PY := everlive_client.py framestore.py card_profile.py \
+             status_model.py theme.py i18n.py
+
 GC570D_RUNDIR := $(EVERLIVE_LIBDIR)/$(GC570D_DIR)
 GC570D_SED := sed -e 's|/usr/local/libexec/|$(GC570D_RUNDIR)/|g' \
 		  -e 's|/usr/local/bin/|$(GC570D_RUNDIR)/|g'
@@ -77,7 +81,9 @@ install: all
 	# 2. Application runtime tree under $(EVERLIVE_LIBDIR)
 	install -Dm0755 play.sh $(L)/play.sh
 	install -Dm0755 $(VIEWER_DIR)/everlive_viewer.py $(L)/$(VIEWER_DIR)/everlive_viewer.py
-	install -Dm0644 $(VIEWER_DIR)/everlive_client.py $(L)/$(VIEWER_DIR)/everlive_client.py
+	install -m0644 $(addprefix $(VIEWER_DIR)/,$(VIEWER_PY)) $(L)/$(VIEWER_DIR)/
+	install -d $(L)/$(VIEWER_DIR)/locale
+	install -m0644 $(VIEWER_DIR)/locale/*.json $(L)/$(VIEWER_DIR)/locale/
 	install -Dm0644 $(VIEWER_DIR)/everlive.png $(L)/$(VIEWER_DIR)/everlive.png
 	install -d $(L)/$(GC573_DIR) $(L)/$(GC570D_DIR) $(L)/$(CORE_DIR)
 	install -m0755 $(addprefix $(GC573_DIR)/,$(GC573_BINS)) $(GC573_DIR)/vfio_pci_bind.sh $(L)/$(GC573_DIR)/

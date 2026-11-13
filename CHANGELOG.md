@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Console Hub localization:** source-string catalog with English as the default, a German pilot translation, and a pseudo-locale for layout testing. Language selection lives under Advanced → System and applies on the next launch.
 - **Lock-free shared frame store and reusable V4L2 preload engine:**
   - `libeverlive-core` now provides a triple-buffered POSIX shared-memory frame store (`everlive_framestore`) and a card-descriptor-driven V4L2 virtual-camera engine (`libeverlive-core/v4l2`).
   - GC570D keeps `/dev/video60` and `/dev/video61` through `libgc570d-v4l2.so`, now built from the shared engine.
