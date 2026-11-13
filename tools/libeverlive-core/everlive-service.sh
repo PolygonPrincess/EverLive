@@ -125,6 +125,19 @@ else
     ENGINE_ARGS=(--headless)
 fi
 
+# 2b. Optional per-user engine arguments (written by the Console Hub).
+SERVICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/everlive/service.env"
+if [ -r "${SERVICE_CONF}" ]; then
+    # shellcheck disable=SC1090
+    . "${SERVICE_CONF}"
+fi
+if [ -n "${EVERLIVE_SERVICE_ARGS:-}" ]; then
+    read -r -a EVERLIVE_EXTRA_ARGS <<< "${EVERLIVE_SERVICE_ARGS}"
+    if [ "${#EVERLIVE_EXTRA_ARGS[@]}" -gt 0 ]; then
+        ENGINE_ARGS+=("${EVERLIVE_EXTRA_ARGS[@]}")
+    fi
+fi
+
 # 3. Ensure PCI device is bound to vfio-pci
 if [ "$IS_BOUND" -eq 0 ] && [ -n "$CARD_PCI" ]; then
     driver_link="/sys/bus/pci/devices/${CARD_PCI}/driver"

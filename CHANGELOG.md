@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Console Hub background service controls:** install, enable at login, start, stop, disable and uninstall the per-user capture service from Advanced → System & Integrations. The service keeps HDMI passthrough, audio and the shared frame store alive for OBS without the Hub.
+- **Per-app virtual-camera shortcuts:** Advanced → System & Integrations → App Camera Shortcuts creates reversible OBS/Discord/Chrome/Zoom launchers that set `LD_PRELOAD` for one process. Flatpak/Snap sandboxes are detected and left on the v4l2loopback path.
+- **Service engine arguments:** `~/.config/everlive/service.env` can request `--v4l2` and `--audio-tap` for the background engine; `everlive-service.sh` merges those arguments with its defaults.
 - **Lock-free shared frame store and reusable V4L2 preload engine:**
   - `libeverlive-core` now provides a triple-buffered POSIX shared-memory frame store (`everlive_framestore`) and a card-descriptor-driven V4L2 virtual-camera engine (`libeverlive-core/v4l2`).
   - GC570D keeps `/dev/video60` and `/dev/video61` through `libgc570d-v4l2.so`, now built from the shared engine.

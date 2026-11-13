@@ -194,6 +194,13 @@ standby cards and scaling behave the same as the recommended
 `/dev/video10` loopback path. Neither preload library requires `v4l2loopback`
 or DKMS.
 
+The Console Hub can create these per-app launchers for you:
+**Advanced → System & Integrations → App Camera Shortcuts**. They are separate
+application-menu entries, not a session-wide `LD_PRELOAD`, and can be removed
+at any time. For capture without the Hub open, install and enable the
+**Background Service** in the same section; the service keeps the shared
+frame store and optional v4l2loopback/audio tap alive at login.
+
 > Adding support for another capture card? See
 > [`docs/ADDING_A_NEW_CARD.md`](docs/ADDING_A_NEW_CARD.md) §3.4, §4.3 and §6.5
 > for the shared frame-store and preload-descriptor integration contract.
