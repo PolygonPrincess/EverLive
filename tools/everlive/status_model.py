@@ -138,6 +138,8 @@ class EngineSnapshot:
             if self.owner == "remote":
                 return "● Remote Session"
             return "● Userspace VFIO"
+        if self.state == "paused":
+            return "⏸ Capture Paused"
         if self.state == "starting":
             return "● Starting…"
         if self.state == "error":
@@ -149,7 +151,7 @@ class EngineSnapshot:
             return "live"
         if self.state == "error":
             return "error"
-        if self.state == "starting":
+        if self.state in ("starting", "paused"):
             return "starting"
         return "idle"
 
@@ -195,12 +197,21 @@ class StatusSnapshot:
     framegen: FramegenSnapshot = field(default_factory=FramegenSnapshot)
     service: ServiceSnapshot = field(default_factory=ServiceSnapshot)
     notice: Optional[str] = None
+    paused_by: Optional[str] = None
 
     @property
     def card_name(self) -> str:
         return getattr(self.card, "display_name", "EverLive Console Hub")
 
+    def hero_title(self) -> str:
+        if self.paused_by:
+            return "Capture Paused"
+        return self.card_name
+
     def hero_subtitle(self) -> str:
+        if self.paused_by:
+            return (f"Capture card is in use by {self.paused_by} • "
+                    "resumes automatically when they finish")
         if self.signal.starting:
             return "Starting Userspace Engine • Initializing capture • No Audio"
         if not self.signal.locked:

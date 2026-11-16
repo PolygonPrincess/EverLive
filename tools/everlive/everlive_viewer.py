@@ -28,7 +28,10 @@ except ImportError:
     HAS_NUMPY = False
 
 try:
-    from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from everlive_client import (
+        EverLiveIpcClient, paused_state as handoff_paused_state,
+        probe as ipc_probe,
+    )
     from card_profile import (
         detect_card_profile, CAP_FRAMEGEN, CAP_HDR, CAP_DUAL_INPUT,
         CAP_RGB_LED,
@@ -45,7 +48,10 @@ try:
     )
 except ImportError:  # imported as a module from another working directory
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from everlive_client import EverLiveIpcClient, probe as ipc_probe
+    from everlive_client import (
+        EverLiveIpcClient, paused_state as handoff_paused_state,
+        probe as ipc_probe,
+    )
     from card_profile import (
         detect_card_profile, CAP_FRAMEGEN, CAP_HDR, CAP_DUAL_INPUT,
         CAP_RGB_LED,
@@ -61,7 +67,7 @@ except ImportError:  # imported as a module from another working directory
         TEXT_STRONG, WARNING,
     )
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 CONFIG_DIR = os.path.expanduser("~/.config/everlive")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -447,17 +453,26 @@ def detect_gc573_driver() -> Dict[str, Optional[str]]:
     return result
 
 
-def _proc_running(name_prefix: str) -> bool:
-    """Match /proc/<pid>/comm (15-char safe) without relying on pgrep."""
+def _proc_running(name_prefix: str, any_user: bool = False) -> bool:
+    """Match /proc/<pid>/comm (15-char safe) without relying on pgrep.
+
+    Only this user's processes count by default: an engine that belongs to
+    another user is not ours to stop or wait for.  It releases the capture
+    card on request instead (see everlive_handoff.h), so it must not block a
+    launch from here.
+    """
     try:
         pids = os.listdir("/proc")
     except OSError:
         return False
 
+    uid = os.getuid()
     for pid in pids:
         if not pid.isdigit():
             continue
         try:
+            if not any_user and os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
             with open(f"/proc/{pid}/comm", "r") as f:
                 if f.read().strip().startswith(name_prefix):
                     return True
@@ -495,11 +510,11 @@ def _stop_vfio_daemon(wait_s: float = 0.8):
         time.sleep(0.05)
 
 
-def _vfio_streamer_running() -> bool:
+def _vfio_streamer_running(any_user: bool = False) -> bool:
     # Both binaries are longer than 15 chars, so /proc/<pid>/comm is
     # truncated to "gc573_user_stre" or "opengc570d-user".
-    return (_proc_running("gc573_user_stre") or
-            _proc_running("opengc570d-user"))
+    return (_proc_running("gc573_user_stre", any_user) or
+            _proc_running("opengc570d-user", any_user))
 
 
 def _raise_memlock_limit():
@@ -826,7 +841,8 @@ def set_vfio_led(mode: int, async_apply: bool = False) -> bool:
     if not (os.path.isfile(resolved) and os.access(resolved, os.X_OK)):
         return False
 
-    if _vfio_streamer_running():
+    # A streamer owns the card and drives the LED itself, whoever runs it.
+    if _vfio_streamer_running(any_user=True):
         save_settings({"led_mode": mode})
         return True
 
@@ -3951,6 +3967,8 @@ if HAS_QT:
             self._vfio_volume_applies = 0
             self._launch_mode: Optional[str] = None
             self._last_launch_mode = "gaming"
+            # Set while one of our engines has handed the card to another user.
+            self._handoff_paused: Optional[Dict] = None
             # Target mode of an in-flight gaming <-> studio handover.
             self._switch_pending: Optional[str] = None
             self._handoff_tries = 0
@@ -4857,14 +4875,13 @@ if HAS_QT:
 
             has_loopback_node = os.path.exists(V4L2_DEFAULT_DEVICE)
             self.chk_v4l2 = QCheckBox(
-                f"Legacy Loopback ({V4L2_DEFAULT_DEVICE})")
+                f"V4L2 Loopback ({V4L2_DEFAULT_DEVICE})")
             self.chk_v4l2.setChecked(bool(self.saved_cfg.get("v4l2_loopback", False) and has_loopback_node))
             self.chk_v4l2.toggled.connect(self.on_v4l2_toggled)
             if self.vfio_mode:
                 tip = (
-                    "Optional fallback: publishes native frames to a v4l2loopback kernel node. "
-                    "Modern OBS and Discord can connect directly via PipeWire (gc570d_hdmi1_video) "
-                    "or libgc570d-v4l2.so without any kernel modules."
+                    "System-wide loopback node: publishes native frames to a v4l2loopback kernel node. "
+                    "Accessible by OBS, Discord, and browsers without custom preload wrappers."
                 )
                 if not has_loopback_node:
                     tip += f"\n(Note: {V4L2_DEFAULT_DEVICE} is not loaded; module-free capture is active)"
@@ -5099,6 +5116,7 @@ if HAS_QT:
                 self.btn_advanced.setText(f"Advanced Settings  {arrow}")
 
         def _set_launch_running(self, running: bool, mode: Optional[str] = None):
+            self.status.paused_by = None
             if running:
                 self._launch_mode = mode or "gaming"
                 self._last_launch_mode = self._launch_mode
@@ -5168,6 +5186,94 @@ if HAS_QT:
 
             self._update_vdev_label()
             self._update_tray_menu()
+            if self._handoff_paused:
+                self._handoff_apply_buttons()
+
+        # -----------------------------------------------------------------
+        # Cross-user handoff: our engine paused for another user
+        # -----------------------------------------------------------------
+        def _handoff_apply_buttons(self):
+            self.btn_launch.setText("Take Back Capture")
+            self.btn_launch.setObjectName("btnLaunchStart")
+            self.btn_launch.setEnabled(True)
+            self.btn_launch.setToolTip(
+                "Ask the other user's session to release the capture card "
+                "and resume capturing here.")
+            self.btn_studio.setText("Stop Paused Session")
+            self.btn_studio.setObjectName("btnStudioStop")
+            self.btn_studio.setEnabled(True)
+            self.btn_studio.setToolTip(
+                "Quit the paused engine instead of resuming it when the "
+                "other user finishes.")
+            for button in (self.btn_launch, self.btn_studio):
+                button.setStyle(button.style())
+
+        def _handoff_update(self) -> bool:
+            """Track the paused marker; True while the paused view is shown."""
+            state = handoff_paused_state()
+            if state is None:
+                if self._handoff_paused is not None:
+                    self._handoff_resumed()
+                return False
+
+            if self._handoff_paused is None:
+                print(f"[*] Capture paused: card in use by {state['holder']}")
+                # Forget the pre-pause signal so it is not shown as live.
+                self.streamer._vfio_live = False
+                self._handoff_paused = state
+                self._handoff_apply_buttons()
+            else:
+                self._handoff_paused = state
+
+            self.status.paused_by = str(state["holder"])
+            self.status.engine = EngineSnapshot(
+                owner="local", state="paused",
+                mode=self._launch_mode or self._last_launch_mode)
+            self.status.signal = SignalSnapshot()
+            self.status.audio = AudioSnapshot(label="No Audio")
+            self._render_status()
+            return True
+
+        def _handoff_resumed(self):
+            self._handoff_paused = None
+            if self.streamer.is_running:
+                # Our own engine restarted in place; its control socket is new.
+                self._set_launch_running(
+                    True, self._launch_mode or self._last_launch_mode)
+                QTimer.singleShot(400, self._ipc_try_attach)
+                self._set_vfio_notice(
+                    "Capture Resumed",
+                    "The capture card is back with this session",
+                    seconds=5.0)
+            else:
+                self._set_launch_running(False)
+
+        def _handoff_take_back(self):
+            state = handoff_paused_state()
+            if state is None:
+                return
+            try:
+                os.kill(state["pid"], signal.SIGUSR1)
+            except OSError:
+                return
+            self.btn_launch.setEnabled(False)
+            self._set_vfio_notice(
+                "Taking Back Capture",
+                f"Asking {state['holder']} to release the capture card",
+                seconds=8.0)
+
+        def _handoff_stop_paused(self):
+            state = self._handoff_paused
+            self._handoff_paused = None
+            if self.streamer.is_running:
+                self._stop_stream()
+                return
+            if state:
+                try:
+                    os.kill(state["pid"], signal.SIGTERM)
+                except OSError:
+                    pass
+            self._set_launch_running(False)
 
         def _retry_audio_props(self):
             # SDL creates its sink-input only once the first HDMI audio
@@ -5484,7 +5590,12 @@ if HAS_QT:
         def toggle_stream(self):
             if self._switch_pending:
                 return
+            if self._handoff_paused:
+                self._handoff_take_back()
+                return
             if self._launch_mode in ("studio", "detached"):
+                # Studio/detached is capturing: hand the card to the embedded
+                # preview or the SDL window.
                 self._switch_mode("gaming")
             elif self._launch_mode == "gaming" or self.streamer.is_running:
                 self._stop_stream()
@@ -5504,7 +5615,11 @@ if HAS_QT:
         def toggle_studio(self):
             if self._switch_pending:
                 return
+            if self._handoff_paused:
+                self._handoff_stop_paused()
+                return
             if self._launch_mode in ("gaming", "detached"):
+                # Gaming/detached is capturing: keep capturing without it.
                 self._switch_mode("studio")
             elif self._launch_mode == "studio" or self.streamer.is_running:
                 self._stop_stream()
@@ -6516,7 +6631,7 @@ if HAS_QT:
 
         def _render_status(self):
             snap = self.status
-            self.lbl_hero_signal.setText(snap.card_name)
+            self.lbl_hero_signal.setText(snap.hero_title())
             if time.time() < self._vfio_notice_until and snap.notice:
                 self.lbl_hero_meta.setText(snap.notice)
             else:
@@ -6568,6 +6683,8 @@ if HAS_QT:
                 engine_state="live" if self.streamer.is_running else "off")
 
         def _update_status_vfio(self):
+            if self._handoff_update():
+                return
             if self._remote and not self.streamer.is_running:
                 # The remote streamer owns these values; its 1 Hz snapshot
                 # already drives the hero labels through _on_remote_status.

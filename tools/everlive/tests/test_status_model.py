@@ -115,6 +115,15 @@ class SnapshotTests(unittest.TestCase):
             "● Remote Session")
         self.assertEqual(
             EngineSnapshot(state="error").label(), "⚠ Engine Error")
+        self.assertEqual(
+            EngineSnapshot(state="paused").label(), "⏸ Capture Paused")
+
+    def test_paused_snapshot(self) -> None:
+        snap = StatusSnapshot(card=GC573_PROFILE, paused_by="otheruser")
+        self.assertEqual(snap.hero_title(), "Capture Paused")
+        self.assertIn("otheruser", snap.hero_subtitle())
+        self.assertEqual(
+            EngineSnapshot(state="paused").tone(), "starting")
 
 
 if __name__ == "__main__":

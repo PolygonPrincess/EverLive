@@ -57,7 +57,7 @@ As of **EverLive v1.0.0**, this userspace engine is the default, primary driver 
 
 ## Building
 
-Sources live in `src/`; the four binaries are written to this directory so
+Sources live in `src/`; the binaries and preload library are written to this directory so
 `play.sh`, `install.sh`, `uninstall.sh` and the systemd units resolve them by
 path.
 
@@ -91,7 +91,7 @@ gc573_user_streamer [PCI_ADDRESS] [OPTIONS]
   --vsync/--no-vsync   Pace presentation to the display refresh (default: off)
   --aspect MODE        auto|16:9|4:3|stretch
   --scale MODE         fit|integer (pixel-perfect integer scaling; alias: --integer-scale)
-  --volume, -v 0..100  Initial playback volume percentage
+  --volume, -v 0.0..1.5 Playback audio gain factor (default: 1.0; 0.0=mute, 1.5=150%)
   --mute               Start with audio muted
   --framegen MODE      off|60to120|30to60 (LSFG-VK 2x frame generation)
   --fg-flow-scale S    Optical flow scale: 0.5|0.75|1.0 (default: 1.0)
@@ -143,8 +143,36 @@ render loop through a seqlock, so remote queries never touch the DMA path.
 ```console
 $ printf '{"jsonrpc":"2.0","id":1,"method":"status.get"}\n' \
     | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/everlive.sock"
-{"jsonrpc":"2.0","id":1,"result":{"proto":1,"version":"1.5.0",...}}
+{"jsonrpc":"2.0","id":1,"result":{"proto":1,"version":"1.6.0",...}}
 ```
+
+## Sharing the Card Between Users
+
+VFIO gives the card to one process, so two users logged in at the same time
+cannot both capture. Instead of making one of them shut everything down, the
+engine that holds the card releases it when another user starts capture:
+
+1. The holder listens on an abstract Unix socket named after the card
+   (`everlive-handoff-<pci address>`).
+2. A starting streamer that finds the card taken by another user asks for it.
+3. The running engine tears down, closes VFIO and stays alive in a paused
+   state. An idle `everlive_userd` LED daemon simply exits.
+4. When the other session ends, the paused engine restarts itself with its
+   original arguments. It never interrupts a capture that is still running.
+
+While paused, the Control Hub shows **Capture Paused** and offers
+**Take Back Capture**; without the Hub, `kill -USR1 <pid>` does the same and
+`SIGTERM` quits the paused engine. The paused state is published in
+`$XDG_RUNTIME_DIR/everlive.paused`.
+
+- Auth: `SO_PEERCRED` / `SO_PEERGROUPS`. Only users who have group access to
+  the card's `/dev/vfio/<group>` node (the `video` group in the shipped udev
+  rule) may ask. A user who reaches the node only through a logind ACL is not
+  recognised.
+- A second instance started by the *same* user still fails as before.
+  `EVERLIVE_HANDOFF_SAME_USER=1` lifts that for testing with one account.
+- Capture in the yielding session stops for as long as the other user holds
+  the card, and the card is fully closed for a moment during each handoff.
 
 ## HDR10 / HLG to SDR
 
@@ -259,7 +287,8 @@ Implementation notes:
 
 - A lock-free SPSC ring (64 KiB) connects the audio worker to the PipeWire RT
   thread; the audio path never blocks on the graph.
-- The tap always publishes **S16_LE stereo**. 24-bit HDMI carriers arrive as
+- The tap dynamically publishes S16_LE in stereo (2 ch), 5.1 (6 ch), or 7.1
+  (8 ch) matching the negotiated source layout. 24-bit HDMI carriers arrive as
   left-aligned S32LSB and are re-quantised; the playback path is untouched.
 - The stream is connected only once the HDMI sample rate is known, so a
   44.1 kHz source is never played at 48 kHz pitch.
