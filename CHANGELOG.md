@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Fullscreen OSD card (engine):**
+  - The GC573 and GC570D engines now draw a three-line card in fullscreen: card and HDMI input identity, source→output route with chroma and audio rate, and a row of hotkey chips (`A` Aspect, `L` Scale, `M` Mute, `Tab` Hide; DUO adds input and PiP).
+  - Windowed and embedded sessions keep the compact readout so the Hub viewport stays unobstructed. The card follows the existing OSD position setting and is toggled by the same OSD hotkey.
 - **Live GC570D presentation switching (`mode.set`):**
   - The Live Gamer DUO engine now implements the unified `mode.set` JSON-RPC method. The Console Hub can dock a headless capture session into its viewport, or return it to headless, without releasing VFIO or interrupting the DMA rings, the V4L2/SHM outputs or HDMI audio.
   - `everlive-ctl runtime mode <gaming|headless> [winid]` exposes the same switch from the CLI.
